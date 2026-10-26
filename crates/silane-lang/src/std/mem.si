@@ -1,0 +1,15 @@
+// Memories from the silane library (`silane::mem`).
+
+// A RAM of `D` words of `W` bits, with one write port and one registered read port
+// (the shape of an FPGA block RAM). On each clock edge:
+// - if `re` is high, `rdata` takes the word at `raddr` as it was before the edge;
+// - if `we` is high, the word at `waddr` becomes `wdata`.
+// `rdata` holds while `re` is low. Its value is registered, so it never depends
+// combinationally on the inputs. The contents are not reset.
+extern module Mem<W = 8, D = 16>(
+    we: u1,
+    waddr: u<max(clog2(D), 1)>,
+    wdata: u<W>,
+    re: u1,
+    raddr: u<max(clog2(D), 1)>,
+) -> (rdata: u<W>) = "::silane::mem::Mem";

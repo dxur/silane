@@ -1,0 +1,51 @@
+// One-dimensional inverse transforms (RFC 6386, section 14) on 16-bit two's
+// complement values. Results are 20-bit two's complement, before any rounding.
+
+// Sign-extends a 16-bit value to 20 bits.
+module Sext16(x: u16) -> (y: u20) {
+    y = cat(rep(x[15], 4), x);
+}
+
+// `(x * K) >> 16` for an unsigned 16-bit `x` and a 17-bit constant `K`: one
+// multiplier. For a signed `x` the result is `K` too large when `x` is negative.
+module MulShift<K = 0>(x: u16) -> (y: u20) {
+    y = ((x as u33) * K)[16..33] as u20;
+}
+
+// Inverse DCT of four values, plus `R` (a rounding constant for the caller's shift).
+module Idct4<R = 0>(x: [u16; 4]) -> (y: [u20; 4]) {
+    let x0 = Sext16(x[0]).y;
+    let x2 = Sext16(x[2]).y;
+    // c = x1 * sin(pi/8) * sqrt(2) - x3 * cos(pi/8) * sqrt(2), d = x1 * cos + x3 * sin,
+    // with x * sin = (x * 35468) >> 16 and x * cos = x + ((x * 20091) >> 16)
+    // = (x * 85627) >> 16. The products are unsigned; their sign corrections and `R`
+    // are added away from the multipliers, so only two adders follow them.
+    let cu = MulShift::<K = 35468>(x[1]).y - MulShift::<K = 85627>(x[3]).y;
+    let du = MulShift::<K = 85627>(x[1]).y + MulShift::<K = 35468>(x[3]).y;
+    let n1: u1 = x[1][15];
+    let n3: u1 = x[3][15];
+    let c_fix = (if n3 { 85627u20 } else { 0 }) - (if n1 { 35468u20 } else { 0 });
+    let d_fix = 0u20 - (if n1 { 85627u20 } else { 0 }) - (if n3 { 35468u20 } else { 0 });
+    let a = x0 + x2 + R;
+    let b = x0 - x2 + R;
+    y[0] = (a + d_fix) + du;
+    y[1] = (b + c_fix) + cu;
+    y[2] = (b - c_fix) - cu;
+    y[3] = (a - d_fix) - du;
+}
+
+// Inverse Walsh-Hadamard transform of four values.
+module Iwht4(x: [u16; 4]) -> (y: [u20; 4]) {
+    let x0 = Sext16(x[0]).y;
+    let x1 = Sext16(x[1]).y;
+    let x2 = Sext16(x[2]).y;
+    let x3 = Sext16(x[3]).y;
+    let a = x0 + x3;
+    let b = x1 + x2;
+    let c = x1 - x2;
+    let d = x0 - x3;
+    y[0] = a + b;
+    y[1] = c + d;
+    y[2] = a - b;
+    y[3] = d - c;
+}

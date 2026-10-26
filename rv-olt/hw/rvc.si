@@ -1,0 +1,117 @@
+// RV64C: expands a 16-bit compressed instruction to the 32-bit instruction it stands
+// for. Reserved and illegal encodings expand to 0, which the decoder rejects.
+
+import "defs.si";
+
+module Rvc(c: u16) -> (insn: u32) {
+    let f3 = c[13..16];
+    // Full register fields, and the x8..x15 fields of the three-bit forms.
+    let rd = c[7..12];
+    let rs2 = c[2..7];
+    let rdp = cat(0b01_u2, c[2..5]);
+    let rs1p = cat(0b01_u2, c[7..10]);
+    // The common 6-bit signed immediate, sign-extended to 12 bits.
+    let imm6 = cat(rep(c[12], 7), c[2..7]);
+    let shamt = cat(0u6, c[12], c[2..7]);
+
+    // Load/store offsets.
+    let off_w = cat(0u5, c[5], c[10..13], c[6], 0u2);
+    let off_d = cat(0u4, c[5..7], c[10..13], 0u3);
+    let off_lwsp = cat(0u4, c[2..4], c[12], c[4..7], 0u2);
+    let off_ldsp = cat(0u3, c[2..5], c[12], c[5..7], 0u3);
+    let off_swsp = cat(0u4, c[7..9], c[9..13], 0u2);
+    let off_sdsp = cat(0u3, c[7..10], c[10..13], 0u3);
+
+    // C.ADDI4SPN and C.ADDI16SP immediates.
+    let nz4 = cat(0u2, c[7..11], c[11..13], c[5], c[6], 0u2);
+    let nz16 = cat(rep(c[12], 3), c[3..5], c[5], c[2], c[6], 0u4);
+
+    // Jump and branch offsets, sign-extended.
+    let jo = cat(c[12], c[8], c[9..11], c[6], c[7], c[2], c[11], c[3..6], 0u1);
+    let joff = cat(rep(c[12], 9), jo);
+    let bo = cat(c[12], c[5..7], c[2], c[10..12], c[3..5], 0u1);
+    let boff = cat(rep(c[12], 4), bo);
+    // A branch on rs1' against x0, with funct3 0 (C.BEQZ); C.BNEZ sets funct3 to 1.
+    let branch = cat(boff[12], boff[5..11], 0u5, rs1p, 0u3, boff[1..5], boff[11], OPC_BRANCH);
+
+    // Register-register ALU ops on rd'/rs2'; funct7, funct3 and opcode are or-ed in.
+    let alu = cat(0u7, rdp, rs1p, 0u3, rs1p, 0u7);
+
+    insn = 0;
+    match c[0..2] {
+        0 => match f3 {
+            0 => if nz4 != 0 {
+                insn = cat(nz4, 2u5, 0u3, rdp, OPC_OP_IMM);                // C.ADDI4SPN
+            },
+            1 => insn = cat(off_d, rs1p, 3u3, rdp, OPC_LOAD_FP),           // C.FLD
+            2 => insn = cat(off_w, rs1p, 2u3, rdp, OPC_LOAD),              // C.LW
+            3 => insn = cat(off_d, rs1p, 3u3, rdp, OPC_LOAD),              // C.LD
+            5 => insn = cat(off_d[5..12], rdp, rs1p, 3u3, off_d[0..5], OPC_STORE_FP), // C.FSD
+            6 => insn = cat(off_w[5..12], rdp, rs1p, 2u3, off_w[0..5], OPC_STORE),    // C.SW
+            7 => insn = cat(off_d[5..12], rdp, rs1p, 3u3, off_d[0..5], OPC_STORE),    // C.SD
+            _ => {}
+        },
+        1 => match f3 {
+            0 => insn = cat(imm6, rd, 0u3, rd, OPC_OP_IMM),                // C.ADDI / C.NOP
+            1 => if rd != 0 {
+                insn = cat(imm6, rd, 0u3, rd, OPC_OP_IMM_32);              // C.ADDIW
+            },
+            2 => insn = cat(imm6, 0u5, 0u3, rd, OPC_OP_IMM),               // C.LI
+            3 => if rd == 2 {
+                if nz16 != 0 {
+                    insn = cat(nz16, 2u5, 0u3, 2u5, OPC_OP_IMM);           // C.ADDI16SP
+                }
+            } else if cat(c[12], c[2..7]) != 0 {
+                insn = cat(rep(c[12], 15), c[2..7], rd, OPC_LUI);          // C.LUI
+            },
+            4 => match c[10..12] {
+                0 => insn = cat(shamt, rs1p, 5u3, rs1p, OPC_OP_IMM),               // C.SRLI
+                1 => insn = cat(shamt | 0x400, rs1p, 5u3, rs1p, OPC_OP_IMM),       // C.SRAI
+                2 => insn = cat(imm6, rs1p, 7u3, rs1p, OPC_OP_IMM),                // C.ANDI
+                _ => match cat(c[12], c[5..7]) {
+                    0 => insn = alu | 0x4000_0000 | (OPC_OP as u32),               // C.SUB
+                    1 => insn = alu | 0x4000 | (OPC_OP as u32),                    // C.XOR
+                    2 => insn = alu | 0x6000 | (OPC_OP as u32),                    // C.OR
+                    3 => insn = alu | 0x7000 | (OPC_OP as u32),                    // C.AND
+                    4 => insn = alu | 0x4000_0000 | (OPC_OP_32 as u32),            // C.SUBW
+                    5 => insn = alu | (OPC_OP_32 as u32),                          // C.ADDW
+                    _ => {}
+                },
+            },
+            5 => insn = cat(joff[20], joff[1..11], joff[11], joff[12..20], 0u5, OPC_JAL), // C.J
+            6 => insn = branch,                                            // C.BEQZ
+            _ => insn = branch | 0x1000,                                   // C.BNEZ
+        },
+        2 => match f3 {
+            0 => insn = cat(shamt, rd, 1u3, rd, OPC_OP_IMM),               // C.SLLI
+            1 => insn = cat(off_ldsp, 2u5, 3u3, rd, OPC_LOAD_FP),          // C.FLDSP
+            2 => if rd != 0 {
+                insn = cat(off_lwsp, 2u5, 2u3, rd, OPC_LOAD);              // C.LWSP
+            },
+            3 => if rd != 0 {
+                insn = cat(off_ldsp, 2u5, 3u3, rd, OPC_LOAD);              // C.LDSP
+            },
+            4 => if c[12] == 0 {
+                if rs2 == 0 {
+                    if rd != 0 {
+                        insn = cat(0u12, rd, 0u3, 0u5, OPC_JALR);          // C.JR
+                    }
+                } else {
+                    insn = cat(0u7, rs2, 0u5, 0u3, rd, OPC_OP);            // C.MV
+                }
+            } else if rs2 == 0 {
+                if rd == 0 {
+                    insn = 0x0010_0073;                                    // C.EBREAK
+                } else {
+                    insn = cat(0u12, rd, 0u3, 1u5, OPC_JALR);              // C.JALR
+                }
+            } else {
+                insn = cat(0u7, rs2, rd, 0u3, rd, OPC_OP);                 // C.ADD
+            },
+            5 => insn = cat(off_sdsp[5..12], rs2, 2u5, 3u3, off_sdsp[0..5], OPC_STORE_FP), // C.FSDSP
+            6 => insn = cat(off_swsp[5..12], rs2, 2u5, 2u3, off_swsp[0..5], OPC_STORE),    // C.SWSP
+            _ => insn = cat(off_sdsp[5..12], rs2, 2u5, 3u3, off_sdsp[0..5], OPC_STORE),    // C.SDSP
+        },
+        _ => {}
+    }
+}

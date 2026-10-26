@@ -1,0 +1,30 @@
+enum Op {
+    Add,
+    Sub,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Pass,
+}
+
+// Combinational ALU; shifts use the low four bits of `b`.
+module Alu(op: Op, a: u16, b: u16) -> (y: u16, zero: u1, carry: u1) {
+    let wide = match op {
+        Op::Add => (a as u17) + (b as u17),
+        Op::Sub => (a as u17) - (b as u17),
+        _ => 0,
+    };
+    y = match op {
+        Op::Add | Op::Sub => wide[0..16],
+        Op::And => a & b,
+        Op::Or => a | b,
+        Op::Xor => a ^ b,
+        Op::Shl => a << b[0..4],
+        Op::Shr => a >> b[0..4],
+        Op::Pass => a,
+    };
+    zero = y == 0;
+    carry = wide[16];
+}

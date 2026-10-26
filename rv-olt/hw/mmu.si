@@ -1,0 +1,205 @@
+// Sv39 address translation: an 8-entry fully associative TLB in front of a
+// page-table walker that reads one PTE at a time.
+//
+// While idle, a request is answered in the same cycle (`hit`, with `hit_pa` and
+// `hit_pf`) when translation is off (satp bare, or M mode), the address is not
+// canonical, or the TLB holds the page; these outputs never depend on the memory
+// port. Otherwise the walker starts, capturing the request (which needn't be held),
+// and `done` comes later with `pa`, `pf` (page fault) or `af` (access fault reading a
+// PTE).
+//
+// A PTE whose A bit is clear, or whose D bit is clear on a store, raises a page fault
+// rather than being updated (the Svade behaviour); software sets the bits and
+// flushes the TLB, which holds only leaves with A set. `flush` empties the TLB
+// (SFENCE.VMA, satp writes); a walk in progress then completes without filling it.
+
+enum PtwState { Idle, Walk }
+
+const TLB_N = 8;
+
+// Permission checks of a leaf at `lvl` for an access, and the physical address.
+module LeafCheck(
+    va: u64,
+    kind: u2,
+    priv: u2,
+    sum: u1,
+    mxr: u1,
+    lvl: u2,
+    ppn: u44,
+    // D, A, U, X, W, R
+    d: u1,
+    a: u1,
+    u: u1,
+    x: u1,
+    w: u1,
+    r: u1,
+) -> (ok: u1, pa: u64, aligned: u1) {
+    let user_ok = if priv == 0 { u } else { !u | (sum & (kind != 0)) };
+    let access_ok = match kind {
+        0 => x,
+        1 => r | (mxr & x),
+        _ => w,
+    };
+    aligned = match lvl {
+        0 => 1,
+        1 => ppn[0..9] == 0,
+        _ => ppn[0..18] == 0,
+    };
+    ok = user_ok & access_ok & a & ((kind != 2) | d) & aligned;
+    pa = match lvl {
+        0 => cat(ppn, va[0..12]) as u64,
+        1 => cat(ppn[9..44], va[0..21]) as u64,
+        _ => cat(ppn[18..44], va[0..30]) as u64,
+    };
+}
+
+module Ptw(
+    req: u1,
+    va: u64,
+    kind: u2,        // 0 fetch, 1 load, 2 store or AMO
+    priv: u2,        // the effective privilege of the access
+    sum: u1,
+    mxr: u1,
+    satp: u64,
+    flush: u1,
+    mem_ack: u1,
+    mem_err: u1,
+    mem_rdata: u64,
+) -> (
+    hit: u1,
+    hit_pa: u64,
+    hit_pf: u1,
+    done: u1,
+    pa: u64,
+    pf: u1,
+    af: u1,
+    mem_req: u1,
+    mem_addr: u64,
+    busy: u1,        // a walk is in progress
+) {
+    let st: PtwState reset PtwState::Idle;
+    let table: u64;      // physical address of the current table
+    let level: u2;
+    let nofill: u1;      // the TLB was flushed during this walk
+    let w_va: u64;       // the walk's access, captured as it starts
+    let w_kind: u2;
+    let w_priv: u2;
+
+    // TLB entries: the VPN, the level of the leaf (2: 1 GiB, 1: 2 MiB, 0: 4 KiB), its
+    // PPN and permission bits (D, U, X, W, R).
+    let t_valid: [u1; TLB_N];
+    let t_vpn: [u27; TLB_N];
+    let t_lvl: [u2; TLB_N];
+    let t_ppn: [u44; TLB_N];
+    let t_perm: [u5; TLB_N];
+    let victim: u3;
+
+    let translate = satp[63] & (priv != 3);
+    let canonical = (va[38..64] == 0) | (va[38..64] == 0x3ff_ffff);
+    let va_vpn = va[12..39];
+
+    // Lookup: at most one entry matches; its fields are OR-ed together in a tree
+    // (the entries, then each pair of nodes before; TLB_N is a power of two).
+    let hits: [u1; 2 * TLB_N - 1];
+    let h_lvl: [u2; 2 * TLB_N - 1];
+    let h_ppn: [u44; 2 * TLB_N - 1];
+    let h_perm: [u5; 2 * TLB_N - 1];
+    for i in 0..TLB_N {
+        let e = t_vpn[i];
+        let m = t_valid[i] & (e[18..27] == va_vpn[18..27])
+            & ((t_lvl[i] == 2) | (e[9..18] == va_vpn[9..18]))
+            & ((t_lvl[i] != 0) | (e[0..9] == va_vpn[0..9]));
+        hits[i] = m;
+        h_lvl[i] = if m { t_lvl[i] } else { 0 };
+        h_ppn[i] = if m { t_ppn[i] } else { 0 };
+        h_perm[i] = if m { t_perm[i] } else { 0 };
+    }
+    for j in 0..TLB_N - 1 {
+        hits[TLB_N + j] = hits[2 * j] | hits[2 * j + 1];
+        h_lvl[TLB_N + j] = h_lvl[2 * j] | h_lvl[2 * j + 1];
+        h_ppn[TLB_N + j] = h_ppn[2 * j] | h_ppn[2 * j + 1];
+        h_perm[TLB_N + j] = h_perm[2 * j] | h_perm[2 * j + 1];
+    }
+    let root = 2 * TLB_N - 2;
+    let hp = h_perm[root];
+    let tc = LeafCheck(
+        va, kind, priv, sum, mxr, h_lvl[root], h_ppn[root],
+        hp[4], 1, hp[3], hp[2], hp[1], hp[0],
+    );
+
+    let idle = st == PtwState::Idle;
+    hit = idle & req & (!translate | !canonical | hits[root]);
+    hit_pa = if !translate { va } else { tc.pa };
+    hit_pf = translate & (!canonical | !tc.ok);
+
+    // The walker (tables are 4 KiB aligned).
+    let vpn = match level {
+        0 => w_va[12..21],
+        1 => w_va[21..30],
+        _ => w_va[30..39],
+    };
+    mem_addr = cat(table[12..64], vpn, 0u3);
+    let pte = mem_rdata;
+    let invalid = !pte[0] | (!pte[1] & pte[2]) | (pte[54..64] != 0);
+    let leaf = pte[1] | pte[3];
+    let wc = LeafCheck(
+        w_va, w_kind, w_priv, sum, mxr, level, pte[10..54],
+        pte[7], pte[6], pte[4], pte[3], pte[2], pte[1],
+    );
+
+    done = 0;
+    pa = wc.pa;
+    pf = 0;
+    af = 0;
+    mem_req = 0;
+    busy = !idle;
+    match st {
+        PtwState::Idle => if req & !hit {
+            st <= PtwState::Walk;
+            table <= cat(satp[0..44], 0u12) as u64;
+            level <= 2;
+            nofill <= 0;
+            w_va <= va;
+            w_kind <= kind;
+            w_priv <= priv;
+        },
+        PtwState::Walk => {
+            mem_req = 1;
+            if mem_ack {
+                if mem_err {
+                    done = 1;
+                    af = 1;
+                    st <= PtwState::Idle;
+                } else if invalid | (!leaf & (level == 0)) {
+                    done = 1;
+                    pf = 1;
+                    st <= PtwState::Idle;
+                } else if leaf {
+                    done = 1;
+                    pf = !wc.ok;
+                    st <= PtwState::Idle;
+                    // Keep leaves that are accessed and aligned; permissions are
+                    // checked again on every hit.
+                    if pte[6] & wc.aligned & !nofill & !flush {
+                        t_valid[victim] <= 1;
+                        t_vpn[victim] <= w_va[12..39];
+                        t_lvl[victim] <= level;
+                        t_ppn[victim] <= pte[10..54];
+                        t_perm[victim] <= cat(pte[7], pte[4], pte[3], pte[2], pte[1]);
+                        victim <= victim + 1;
+                    }
+                } else {
+                    table <= cat(pte[10..54], 0u12) as u64;
+                    level <= level - 1;
+                }
+            }
+        }
+    }
+
+    if flush {
+        nofill <= 1;
+        for i in 0..TLB_N {
+            t_valid[i] <= 0;
+        }
+    }
+}

@@ -1,0 +1,187 @@
+// Decodes a 32-bit instruction (compressed ones are expanded first, see rvc.si).
+// Only legality that depends on the encoding is checked here; privilege and
+// mstatus.FS checks are the core's.
+
+import "defs.si";
+
+module Decode(insn: u32) -> (u: Uop) {
+    let opc = insn[0..7];
+    let f3 = insn[12..15];
+    let f7 = insn[25..32];
+    let rd = insn[7..12];
+    let rs1 = insn[15..20];
+    let rs2 = insn[20..25];
+
+    let imm_i = cat(rep(insn[31], 52), insn[20..32]);
+    let imm_s = cat(rep(insn[31], 52), insn[25..32], insn[7..12]);
+    let imm_b = cat(rep(insn[31], 52), insn[7], insn[25..31], insn[8..12], 0u1);
+    let imm_u = cat(rep(insn[31], 32), insn[12..32], 0u12);
+    let imm_j = cat(rep(insn[31], 44), insn[12..20], insn[20], insn[21..31], 0u1);
+
+    // The ALU op of OP/OP-IMM for funct3; `alt` is insn[30] (SUB, SRA).
+    let alt = insn[30];
+    let alu_op = match f3 {
+        0 => AluOp::Add,
+        1 => AluOp::Sll,
+        2 => AluOp::Slt,
+        3 => AluOp::Sltu,
+        4 => AluOp::Xor,
+        5 => if alt { AluOp::Sra } else { AluOp::Srl },
+        6 => AluOp::Or,
+        _ => AluOp::And,
+    };
+
+    u.cls = Cls::Illegal;
+    u.alu = AluOp::Add;
+    u.word = 0;
+    u.pc_a = 0;
+    u.zero_a = 0;
+    u.use_imm = 1;
+    u.imm = imm_i;
+    u.rd = rd;
+    u.rs1 = rs1;
+    u.rs2 = rs2;
+    u.f3 = f3;
+
+    match opc {
+        OPC_LUI => {
+            u.cls = Cls::Alu;
+            u.zero_a = 1;
+            u.imm = imm_u;
+        }
+        OPC_AUIPC => {
+            u.cls = Cls::Alu;
+            u.pc_a = 1;
+            u.imm = imm_u;
+        }
+        OPC_JAL => {
+            u.cls = Cls::Jal;
+            u.imm = imm_j;
+        }
+        OPC_JALR => if f3 == 0 {
+            u.cls = Cls::Jalr;
+        },
+        OPC_BRANCH => {
+            // The ALU compares rs1 and rs2; the target is pc + imm.
+            u.use_imm = 0;
+            u.imm = imm_b;
+            if (f3 != 2) & (f3 != 3) {
+                u.cls = Cls::Branch;
+            }
+        }
+        OPC_LOAD => if f3 != 7 {
+            u.cls = Cls::Load;
+        },
+        OPC_STORE => {
+            u.imm = imm_s;
+            if f3[2] == 0 {
+                u.cls = Cls::Store;
+            }
+        }
+        OPC_OP_IMM => {
+            u.alu = alu_op;
+            // Shifts: a 6-bit amount; funct6 must be 000000 (or 010000 for SRAI).
+            if f3 == 1 {
+                if insn[26..32] == 0 {
+                    u.cls = Cls::Alu;
+                }
+            } else if f3 == 5 {
+                if (insn[26..32] & 0b101111) == 0 {
+                    u.cls = Cls::Alu;
+                }
+            } else {
+                u.cls = Cls::Alu;
+            }
+        }
+        OPC_OP_IMM_32 => {
+            u.alu = alu_op;
+            u.word = 1;
+            if f3 == 0 {
+                u.cls = Cls::Alu;
+            } else if f3 == 1 {
+                if f7 == 0 {
+                    u.cls = Cls::Alu;
+                }
+            } else if f3 == 5 {
+                if (f7 & 0b1011111) == 0 {
+                    u.cls = Cls::Alu;
+                }
+            }
+        }
+        OPC_OP => {
+            u.use_imm = 0;
+            u.alu = if alt & (f3 == 0) { AluOp::Sub } else { alu_op };
+            if f7 == 1 {
+                u.cls = Cls::MulDiv;
+            } else if f7 == 0 {
+                u.cls = Cls::Alu;
+            } else if (f7 == 0x20) & ((f3 == 0) | (f3 == 5)) {
+                u.cls = Cls::Alu;
+            }
+        }
+        OPC_OP_32 => {
+            u.use_imm = 0;
+            u.word = 1;
+            u.alu = if alt & (f3 == 0) { AluOp::Sub } else { alu_op };
+            if f7 == 1 {
+                if (f3 == 0) | (f3[2] == 1) {
+                    u.cls = Cls::MulDiv;
+                }
+            } else if (f7 == 0) & ((f3 == 0) | (f3 == 1) | (f3 == 5)) {
+                u.cls = Cls::Alu;
+            } else if (f7 == 0x20) & ((f3 == 0) | (f3 == 5)) {
+                u.cls = Cls::Alu;
+            }
+        }
+        OPC_AMO => {
+            // funct5: LR (rs2 = 0), SC and the AMOs. The address is rs1 + 0.
+            u.imm = 0;
+            let f5 = insn[27..32];
+            if (f3 == 2) | (f3 == 3) {
+                if f5 == 2 {
+                    if rs2 == 0 {
+                        u.cls = Cls::Amo;
+                    }
+                } else if (f5 == 0) | (f5 == 1) | (f5 == 3) | (f5 == 4) | (f5 == 8) | (f5 == 12)
+                    | (f5 == 16) | (f5 == 20) | (f5 == 24) | (f5 == 28) {
+                    u.cls = Cls::Amo;
+                }
+            }
+        }
+        OPC_MISC_MEM => if (f3 == 0) | (f3 == 1) {
+            u.cls = Cls::Fence;
+        },
+        OPC_SYSTEM => {
+            if f3 == 0 {
+                if insn == 0x0000_0073 {
+                    u.cls = Cls::Ecall;
+                } else if insn == 0x0010_0073 {
+                    u.cls = Cls::Ebreak;
+                } else if insn == 0x3020_0073 {
+                    u.cls = Cls::Mret;
+                } else if insn == 0x1020_0073 {
+                    u.cls = Cls::Sret;
+                } else if insn == 0x1050_0073 {
+                    u.cls = Cls::Wfi;
+                } else if (f7 == 0b0001001) & (rd == 0) {
+                    u.cls = Cls::Sfence;
+                }
+            } else if f3 != 4 {
+                u.cls = Cls::Csr;
+                // CSRR*I: the immediate is the rs1 field.
+                u.imm = rs1 as u64;
+            }
+        }
+        OPC_LOAD_FP => if (f3 == 2) | (f3 == 3) {
+            u.cls = Cls::FpLoad;
+        },
+        OPC_STORE_FP => {
+            u.imm = imm_s;
+            if (f3 == 2) | (f3 == 3) {
+                u.cls = Cls::FpStore;
+            }
+        }
+        OPC_OP_FP | OPC_MADD | OPC_MSUB | OPC_NMSUB | OPC_NMADD => u.cls = Cls::Fp,
+        _ => {}
+    }
+}

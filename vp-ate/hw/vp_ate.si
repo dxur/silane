@@ -1,0 +1,73 @@
+// VP8 key-frame decoder.
+//
+// The host streams each frame twice: from its first byte through partition 0 on
+// `p0`, and partition 1 (from byte `part1_offset`, ending with `p1_last`) on `p1`.
+// Reconstructed macroblocks come out on `px` in raster order (see `Recon`).
+// Supported: key frames up to 1920 pixels wide, one token partition, no
+// segmentation; the loop filter is not applied.
+
+import "headers.si";
+import "tokens.si";
+import "recon.si";
+
+module VpAte(
+    p0_valid: u1,
+    p0_data: u8,
+    p1_valid: u1,
+    p1_data: u8,
+    p1_last: u1,
+    px_ready: u1,
+) -> (
+    p0_ready: u1,
+    p1_ready: u1,
+    px_valid: u1,
+    px_data: u32,
+    frame_done: u1,
+    // Frame header fields, valid while `info_valid` is high.
+    info_valid: u1,
+    width: u14,
+    height: u14,
+    part1_offset: u20,
+    // An unsupported or invalid frame: decoding stops until reset.
+    error: u1,
+) {
+    let hdrs: Headers;
+    let toks: Tokens;
+    let rec: Recon;
+
+    hdrs.p0_valid = p0_valid;
+    hdrs.p0_data = p0_data;
+    hdrs.frame_done = rec.frame_done;
+    hdrs.hdr_ready = toks.hdr_ready;
+    p0_ready = hdrs.p0_ready;
+
+    toks.p1_valid = p1_valid;
+    toks.p1_data = p1_data;
+    toks.p1_last = p1_last;
+    toks.info_valid = hdrs.info_valid;
+    toks.mb_w = hdrs.mb_w;
+    toks.mb_h = hdrs.mb_h;
+    toks.quant = hdrs.quant;
+    toks.prob_we = hdrs.prob_we;
+    toks.prob_addr = hdrs.prob_addr;
+    toks.prob_ctx = hdrs.prob_ctx;
+    toks.prob_data = hdrs.prob_data;
+    toks.hdr_valid = hdrs.hdr_valid;
+    toks.hdr = hdrs.hdr;
+    p1_ready = toks.p1_ready;
+
+    rec.coef = toks.coef;
+    rec.mb = toks.mb;
+    rec.mb_w = hdrs.mb_w;
+    rec.mb_h = hdrs.mb_h;
+    rec.px_ready = px_ready;
+    px_valid = rec.px_valid;
+    px_data = rec.px_data;
+    frame_done = rec.frame_done;
+
+    info_valid = hdrs.info_valid;
+    width = hdrs.width;
+    height = hdrs.height;
+    part1_offset = hdrs.part1_offset;
+    error = hdrs.error;
+}

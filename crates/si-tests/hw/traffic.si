@@ -1,0 +1,40 @@
+enum Light {
+    Red,
+    RedAmber,
+    Green,
+    Amber,
+}
+
+const GREEN_TIME = 5;
+const AMBER_TIME = 2;
+const RED_TIME = 4;
+
+// Traffic light: cycles Red → RedAmber → Green → Amber → Red. A pedestrian request
+// cuts a green phase short.
+module TrafficLight(request: u1) -> (light: Light reset Light::Red, walk: u1) {
+    let timer: u4 reset RED_TIME;
+
+    let expired = timer == 0;
+    timer <= timer - 1;
+
+    match light {
+        Light::Red => if expired {
+            light <= Light::RedAmber;
+            timer <= 1;
+        },
+        Light::RedAmber => if expired {
+            light <= Light::Green;
+            timer <= GREEN_TIME;
+        },
+        Light::Green => if expired | request {
+            light <= Light::Amber;
+            timer <= AMBER_TIME;
+        },
+        Light::Amber => if expired {
+            light <= Light::Red;
+            timer <= RED_TIME;
+        },
+    }
+
+    walk = light == Light::Red;
+}

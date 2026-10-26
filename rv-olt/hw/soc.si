@@ -1,0 +1,125 @@
+// rv-olt SoC: one core and the devices Linux needs, laid out like QEMU's `virt`
+// machine (see dts/rv-olt.dts):
+//
+//   0x0000_1000  boot ROM      a0 = hart id, a1 = `dtb_addr`, jump to `boot_entry`
+//   0x0010_0000  test device   writes leave on `test_*` (poweroff / pass / fail)
+//   0x0200_0000  CLINT
+//   0x0c00_0000  PLIC          source 10: the UART
+//   0x1000_0000  UART          ns16550a
+//   0x8000_0000  RAM           outside the SoC, on the `ram_*` port
+//
+// Anything else is an access fault. Devices answer from registers, the cycle after
+// they are accessed.
+
+import "core.si";
+import "devices.si";
+
+module Soc(
+    ram_ack: u1,
+    ram_err: u1,
+    ram_rdata: u64,
+    rx_valid: u1,
+    rx_data: u8,
+    // mtime advances by one on each cycle with `rtc_tick` high.
+    rtc_tick: u1,
+    boot_entry: u64,
+    dtb_addr: u64,
+) -> (
+    ram_req: u1,
+    ram_addr: u64,
+    ram_we: u1,
+    ram_wdata: u64,
+    ram_be: u8,
+    rx_ready: u1,
+    tx_valid: u1,
+    tx_data: u8,
+    test_valid: u1,
+    test_data: u32,
+    dbg_retire: u1,
+    dbg_trap: u1,
+    dbg_pc: u64,
+    dbg_insn: u32,
+) {
+    let core: Core;
+    let addr = core.mem_addr;
+    let req = core.mem_req;
+    let we = core.mem_we;
+    let wdata = core.mem_wdata;
+    let be = core.mem_be;
+
+    let in_ram = addr >= 0x8000_0000;
+    let in_rom = addr[12..64] == 0x1;
+    let in_test = addr[12..64] == 0x100;
+    let in_clint = addr[16..64] == 0x200;
+    let in_plic = addr[26..64] == 0x3;
+    let in_uart = addr[8..64] == 0x10_0000;
+
+    ram_req = req & in_ram;
+    ram_addr = addr;
+    ram_we = we;
+    ram_wdata = wdata;
+    ram_be = be;
+
+    // Boot ROM:
+    //   auipc t0, 0; csrr a0, mhartid; ld a1, 32(t0); ld t0, 24(t0); jr t0; nop
+    //   .dword boot_entry, dtb_addr
+    let rom = match addr[3..6] {
+        0 => 0xf140_2573_0000_0297,
+        1 => 0x0182_b283_0202_b583,
+        2 => 0x0000_0013_0002_8067,
+        3 => boot_entry,
+        4 => dtb_addr,
+        _ => 0,
+    };
+
+    // A device access happens in its first cycle; the answer is registered and given
+    // (with the acknowledge) in the next.
+    let dev_wait: u1;
+    let dev_rdata: u64;
+    let dev_err: u1;
+    let dev_sel = req & !in_ram & !dev_wait;
+    dev_wait <= dev_sel;
+
+    let clint = Clint(
+        sel: dev_sel & in_clint, off: addr[0..16], we: we, wdata: wdata, be: be, tick: rtc_tick,
+    );
+    let uart = Uart(sel: dev_sel & in_uart, we: we, wdata: wdata, be: be, rx_valid: rx_valid, rx_data: rx_data);
+    let plic = Plic(
+        sel: dev_sel & in_plic, off: addr[0..26] as u32, we: we, wdata: wdata, be: be,
+        src: (uart.irq as u16) << 10,
+    );
+    rx_ready = uart.rx_ready;
+    tx_valid = uart.tx_valid;
+    tx_data = uart.tx_data;
+
+    test_valid = dev_sel & in_test & we & be[0];
+    test_data = wdata[0..32];
+
+    dev_err <= !(in_rom | in_test | in_clint | in_plic | in_uart);
+    dev_rdata <= if in_rom {
+        rom
+    } else if in_clint {
+        clint.rdata
+    } else if in_plic {
+        plic.rdata
+    } else if in_uart {
+        uart.rdata
+    } else {
+        0
+    };
+    // The answer is the device's when one was accessed last cycle, else the RAM's (which
+    // answers only RAM requests): no address decoding on the way back.
+    core.mem_ack = ram_ack | dev_wait;
+    core.mem_err = if dev_wait { dev_err } else { ram_err };
+    core.mem_rdata = if dev_wait { dev_rdata } else { ram_rdata };
+    core.mtip = clint.mtip;
+    core.msip = clint.msip;
+    core.meip = plic.eip[0];
+    core.seip = plic.eip[1];
+    core.mtime = clint.mtime;
+
+    dbg_retire = core.dbg_retire;
+    dbg_trap = core.dbg_trap;
+    dbg_pc = core.dbg_pc;
+    dbg_insn = core.dbg_insn;
+}

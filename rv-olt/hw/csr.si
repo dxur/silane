@@ -1,0 +1,331 @@
+// Control and status registers, privilege modes, traps and interrupts (M, S and U;
+// no hypervisor). Implemented counters: cycle, time (from the CLINT), instret; the
+// HPM counters, PMP registers and envcfg read as zero and ignore writes.
+
+const SSTATUS_MASK: u64 = 0x8000_0003_000d_e762;
+const MEDELEG_MASK: u64 = 0xb3ff;
+const MIDELEG_MASK: u64 = 0x222;
+const MIE_MASK: u64 = 0xaaa;
+// Readable CSRs with a value (see the read tree in Csr).
+const CSR_NR = 32;
+// RV64 with A, C, D, F, I, M, S, U.
+const MISA: u64 = 0x8000_0000_0014_112d;
+
+module Csr(
+    // A CSR instruction: `op` is 1 (RW), 2 (RS) or 3 (RC); `wr` is high if it writes.
+    // `illegal` is for `addr` this cycle; `rdata` is its value read in the previous
+    // cycle, and the write (on `exec`) applies to that value.
+    addr: u12,
+    op: u2,
+    src: u64,
+    wr: u1,
+    exec: u1,
+    // Take a trap: `cause` has the interrupt flag in bit 63. `trap_pc` is where to go.
+    trap: u1,
+    cause: u64,
+    tval: u64,
+    epc: u64,
+    // Return from a trap: `ret_pc` is where to go.
+    mret: u1,
+    sret: u1,
+    // An instruction retired.
+    retire: u1,
+    // A floating-point instruction completed: or `flags` into fflags; `fp_dirty`
+    // marks the FP state dirty.
+    fp_done: u1,
+    fp_flags: u5,
+    fp_dirty: u1,
+    // Interrupt lines.
+    mtip: u1,
+    msip: u1,
+    meip: u1,
+    seip: u1,
+    mtime: u64,
+) -> (
+    rdata: u64,
+    illegal: u1,
+    trap_pc: u64,
+    ret_pc: u64,
+    // An interrupt to take before the next instruction, and its cause.
+    irq: u1,
+    irq_cause: u64,
+    // Some interrupt is pending and enabled in mie (wakes WFI).
+    wake: u1,
+    priv: u2 reset 3,
+    satp: u64,
+    mprv: u1,
+    mpp: u2,
+    sum: u1,
+    mxr: u1,
+    tvm: u1,
+    tw: u1,
+    tsr: u1,
+    fs: u2,
+    frm: u3,
+) {
+    let mie: u1;
+    let sie: u1;
+    let mpie: u1;
+    let spie: u1;
+    let spp: u1;
+    let medeleg: u64;
+    let mideleg: u64;
+    let mie_r: u64;
+    let ssip: u1;
+    let stip: u1;
+    let seip_sw: u1;
+    let mtvec: u64;
+    let stvec: u64;
+    let mcounteren: u32;
+    let scounteren: u32;
+    let mscratch: u64;
+    let sscratch: u64;
+    let mepc: u64;
+    let sepc: u64;
+    let mcause: u64;
+    let scause: u64;
+    let mtval: u64;
+    let stval: u64;
+    let mcycle: u64;
+    let minstret: u64;
+    let fflags: u5;
+
+    let sd = fs == 3;
+    let mstatus = cat(
+        sd, 0u27, 2u2, 2u2, 0u9, tsr, tw, tvm, mxr, sum, mprv, 0u2, fs, mpp, 0u2,
+        spp, mpie, 0u1, spie, 0u1, mie, 0u1, sie, 0u1,
+    );
+    let mip = cat(
+        0u52, meip, 0u1, seip_sw | seip, 0u1, mtip, 0u1, stip, 0u1, msip, 0u1, ssip, 0u1,
+    );
+
+    // Counters (cycle, time, instret, hpm3..31) visible below M per [ms]counteren.
+    let cidx = addr[0..5];
+    let counter_ok = (priv == 3)
+        | ((mcounteren >> cidx)[0] & ((priv == 1) | (scounteren >> cidx)[0]));
+
+    // The read value: one term per readable CSR (only the selected one nonzero), or-ed
+    // together in a tree. CSRs that read as zero only count for `known`.
+    let ra: [u12; CSR_NR];
+    let rv: [u64; CSR_NR];
+    ra[0] = 0x001;  rv[0] = fflags as u64;
+    ra[1] = 0x002;  rv[1] = frm as u64;
+    ra[2] = 0x003;  rv[2] = cat(frm, fflags) as u64;
+    ra[3] = 0xc00;  rv[3] = mcycle;
+    ra[4] = 0xc01;  rv[4] = mtime;
+    ra[5] = 0xc02;  rv[5] = minstret;
+    ra[6] = 0x100;  rv[6] = mstatus & SSTATUS_MASK;
+    ra[7] = 0x104;  rv[7] = mie_r & mideleg;
+    ra[8] = 0x105;  rv[8] = stvec;
+    ra[9] = 0x106;  rv[9] = scounteren as u64;
+    ra[10] = 0x140; rv[10] = sscratch;
+    ra[11] = 0x141; rv[11] = sepc;
+    ra[12] = 0x142; rv[12] = scause;
+    ra[13] = 0x143; rv[13] = stval;
+    ra[14] = 0x144; rv[14] = mip & mideleg;
+    ra[15] = 0x180; rv[15] = satp;
+    ra[16] = 0x300; rv[16] = mstatus;
+    ra[17] = 0x301; rv[17] = MISA;
+    ra[18] = 0x302; rv[18] = medeleg;
+    ra[19] = 0x303; rv[19] = mideleg;
+    ra[20] = 0x304; rv[20] = mie_r;
+    ra[21] = 0x305; rv[21] = mtvec;
+    ra[22] = 0x306; rv[22] = mcounteren as u64;
+    ra[23] = 0x340; rv[23] = mscratch;
+    ra[24] = 0x341; rv[24] = mepc;
+    ra[25] = 0x342; rv[25] = mcause;
+    ra[26] = 0x343; rv[26] = mtval;
+    ra[27] = 0x344; rv[27] = mip;
+    ra[28] = 0xb00; rv[28] = mcycle;
+    ra[29] = 0xb02; rv[29] = minstret;
+    // Zero: senvcfg, menvcfg, mcountinhibit.
+    ra[30] = 0x10a; rv[30] = 0;
+    ra[31] = 0x30a; rv[31] = 0;
+    let tree: [[u64; CSR_NR]; 6];
+    let hits: [[u1; CSR_NR]; 6];
+    for i in 0..CSR_NR {
+        let sel = addr == ra[i];
+        tree[0][i] = if sel { rv[i] } else { 0 };
+        hits[0][i] = sel;
+    }
+    for l in 0..5 {
+        let m = CSR_NR >> (l + 1);
+        for i in 0..m {
+            tree[l + 1][i] = tree[l][2 * i] | tree[l][2 * i + 1];
+            hits[l + 1][i] = hits[l][2 * i] | hits[l][2 * i + 1];
+        }
+        for i in m..CSR_NR {
+            tree[l + 1][i] = 0;
+            hits[l + 1][i] = 0;
+        }
+    }
+    let r = tree[5][0];
+    let known = hits[5][0]
+        | (addr == 0x320)
+        | ((addr >= 0xf11) & (addr <= 0xf15))
+        | ((addr >= 0xc03) & (addr <= 0xc1f))
+        | ((addr >= 0xb03) & (addr <= 0xb1f))
+        | ((addr >= 0x323) & (addr <= 0x33f))
+        | ((addr >= 0x3a0) & (addr <= 0x3ef));
+    // The value read is registered: `rdata` is the CSR's value in the previous cycle,
+    // and a write (`exec`) applies to that value.
+    let r_q: u64;
+    r_q <= r;
+    rdata = r_q;
+
+    let is_counter = addr[5..12] == 0b1100000;   // 0xc00..0xc1f
+    let is_fp = (addr == 0x001) | (addr == 0x002) | (addr == 0x003);
+    illegal = !known
+        | (priv < addr[8..10])
+        | (wr & (addr[10..12] == 3))
+        | ((addr == 0x180) & (priv == 1) & tvm)
+        | (is_fp & (fs == 0))
+        | (is_counter & !counter_ok);
+
+    let w = match op {
+        1 => src,
+        2 => r_q | src,
+        _ => r_q & !src,
+    };
+
+    // Trap entry: delegated to S if taken below M and the cause is delegated.
+    let intr = cause[63];
+    let code = cause[0..6];
+    let deleg = (priv != 3) & (if intr { mideleg >> code } else { medeleg >> code })[0];
+    let tvec = if deleg { stvec } else { mtvec };
+    let base = cat(tvec[2..64], 0u2);
+    trap_pc = if tvec[0] & intr { base + ((code as u64) << 2) } else { base };
+    ret_pc = if mret { mepc } else { sepc };
+
+    // Interrupts: those for M first (unless masked), then those delegated to S.
+    let pend = mip & mie_r;
+    let m_en = (priv != 3) | mie;
+    let s_en = (priv == 0) | ((priv == 1) & sie);
+    let mp = if m_en { pend & !mideleg } else { 0 };
+    let sp = if s_en { pend & mideleg } else { 0 };
+    let sel = if mp != 0 { mp } else { sp };
+    let icode: u4;
+    icode = 5;
+    if sel[1] { icode = 1; }
+    if sel[9] { icode = 9; }
+    if sel[7] { icode = 7; }
+    if sel[3] { icode = 3; }
+    if sel[11] { icode = 11; }
+    irq = (mp | sp) != 0;
+    irq_cause = cat(1u1, 0u59, icode);
+    wake = pend != 0;
+
+    mcycle <= mcycle + 1;
+    if retire {
+        minstret <= minstret + 1;
+    }
+    if fp_done {
+        fflags <= fflags | fp_flags;
+        if fp_dirty | (fp_flags != 0) {
+            fs <= 3;
+        }
+    }
+
+    if trap {
+        if deleg {
+            scause <= cause;
+            sepc <= epc;
+            stval <= tval;
+            spp <= priv[0];
+            spie <= sie;
+            sie <= 0;
+            priv <= 1;
+        } else {
+            mcause <= cause;
+            mepc <= epc;
+            mtval <= tval;
+            mpp <= priv;
+            mpie <= mie;
+            mie <= 0;
+            priv <= 3;
+        }
+    } else if mret {
+        priv <= mpp;
+        mie <= mpie;
+        mpie <= 1;
+        mpp <= 0;
+        if mpp != 3 {
+            mprv <= 0;
+        }
+    } else if sret {
+        priv <= spp as u2;
+        sie <= spie;
+        spie <= 1;
+        spp <= 0;
+        mprv <= 0;
+    } else if exec & wr & !illegal {
+        match addr {
+            0x001 => {
+                fflags <= w[0..5];
+                fs <= 3;
+            }
+            0x002 => {
+                frm <= w[0..3];
+                fs <= 3;
+            }
+            0x003 => {
+                fflags <= w[0..5];
+                frm <= w[5..8];
+                fs <= 3;
+            }
+            0x100 => {
+                sie <= w[1];
+                spie <= w[5];
+                spp <= w[8];
+                fs <= w[13..15];
+                sum <= w[18];
+                mxr <= w[19];
+            }
+            0x104 => mie_r <= (mie_r & !mideleg) | (w & mideleg),
+            0x105 => stvec <= cat(w[2..64], 0u1, w[0]),
+            0x106 => scounteren <= w[0..32],
+            0x140 => sscratch <= w,
+            0x141 => sepc <= cat(w[1..64], 0u1),
+            0x142 => scause <= w,
+            0x143 => stval <= w,
+            0x144 => if mideleg[1] {
+                ssip <= w[1];
+            },
+            0x180 => if (w[60..64] == 0) | (w[60..64] == 8) {
+                satp <= cat(w[60..64], 0u16, w[0..44]);
+            },
+            0x300 => {
+                sie <= w[1];
+                mie <= w[3];
+                spie <= w[5];
+                mpie <= w[7];
+                spp <= w[8];
+                mpp <= if w[11..13] == 2 { 0 } else { w[11..13] };
+                fs <= w[13..15];
+                mprv <= w[17];
+                sum <= w[18];
+                mxr <= w[19];
+                tvm <= w[20];
+                tw <= w[21];
+                tsr <= w[22];
+            }
+            0x302 => medeleg <= w & MEDELEG_MASK,
+            0x303 => mideleg <= w & MIDELEG_MASK,
+            0x304 => mie_r <= w & MIE_MASK,
+            0x305 => mtvec <= cat(w[2..64], 0u1, w[0]),
+            0x306 => mcounteren <= w[0..32],
+            0x340 => mscratch <= w,
+            0x341 => mepc <= cat(w[1..64], 0u1),
+            0x342 => mcause <= w,
+            0x343 => mtval <= w,
+            0x344 => {
+                ssip <= w[1];
+                stip <= w[5];
+                seip_sw <= w[9];
+            }
+            0xb00 => mcycle <= w,
+            0xb02 => minstret <= w,
+            _ => {}
+        }
+    }
+}

@@ -1,0 +1,14 @@
+import "std:mem";
+
+// Pointer chasing: every word holds the address of the next word to read. The read
+// data feeds the read address directly, which is fine because `Mem` reads are
+// registered.
+module Chase(we: u1, waddr: u4, wdata: u4, start: u1, first: u4) -> (addr: u4) {
+    let m = Mem::<W = 4, D = 16>(we: we, waddr: waddr, wdata: wdata, re: true, raddr: addr);
+    addr = if start { first } else { m.rdata };
+}
+
+// A memory with a depth that is not a power of two.
+module Ram12(we: u1, waddr: u10, wdata: u12, raddr: u10) -> (rdata: u12) {
+    rdata = Mem::<W = 12, D = 1000>(we, waddr, wdata, true, raddr).rdata;
+}

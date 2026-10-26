@@ -1,0 +1,576 @@
+// Reconstruction: inverse transforms, intra prediction and output of each
+// macroblock, four pixels per cycle.
+//
+// Two stages work on 4x4 blocks through a pair of transpose buffers:
+// - the front reads a block's coefficients one column per cycle and applies the
+//   vertical transform;
+// - the back applies the horizontal transform one row per cycle, predicts the row in
+//   a second stage, and adds the two and outputs the row in a third.
+// Edges of the macroblock come from the line buffer (the bottom row of the macroblock
+// row above) and from registers (its left column).
+
+import "tokens.si";
+import "transform.si";
+import "predict.si";
+import "std:mem";
+
+// The coefficient buffer (see `CoeffWrite`), with one read port returning a column
+// of a block.
+module CoeffBuf(w: CoeffWrite, re: u1, raddr: u8, eob_raddr: u6) -> (col: [u16; 4], eob: u5) {
+    for r in 0..4 {
+        col[r] = Mem::<W = 16, D = 256>(w.we & (w.row == r), w.addr, w.data, re, raddr).rdata;
+    }
+    eob = Mem::<W = 5, D = 64>(w.eob_we, w.eob_addr, w.eob, re, eob_raddr).rdata;
+}
+
+// Zigzag index of raster position `p`.
+module InvZigzag(p: u4) -> (zz: u4) {
+    zz = match p {
+        0 => 0,
+        1 => 1,
+        2 => 5,
+        3 => 6,
+        4 => 2,
+        5 => 4,
+        6 => 7,
+        7 => 12,
+        8 => 3,
+        9 => 8,
+        10 => 11,
+        11 => 13,
+        12 => 9,
+        13 => 10,
+        14 => 14,
+        _ => 15,
+    };
+}
+
+// Position of block `blk` (0-23): its plane (0 Y, 1 U, 2 V) and column and row in it.
+module BlockPos(blk: u5) -> (plane: u2, bx: u2, by: u2) {
+    if blk < 16 {
+        plane = 0;
+        bx = blk[0..2];
+        by = blk[2..4];
+    } else {
+        plane = if blk < 20 { 1 } else { 2 };
+        bx = blk[0] as u2;
+        by = blk[1] as u2;
+    }
+}
+
+// Sum of four pixels.
+module Sum4(p: [u8; 4]) -> (s: u10) {
+    s = (p[0] as u10) + (p[1] as u10) + (p[2] as u10) + (p[3] as u10);
+}
+
+// `p + r` for a pixel and a 16-bit two's complement residual, clamped to 0..=255.
+module AddClamp(p: u8, r: u16) -> (v: u8) {
+    let s = (p as u17) + cat(r[15], r);
+    v = if s[16] { 0 } else if s[8..16] != 0 { 255 } else { s[0..8] };
+}
+
+module Recon(
+    coef: CoeffWrite,
+    mb: MbInfo,
+    mb_w: u7,
+    mb_h: u11,
+    px_ready: u1,
+) -> (
+    // Four pixels of a row, the leftmost in bits 7..0. Each macroblock is output as
+    // its 4x4 blocks in order (16 luma in raster order, then 4 U, then 4 V), each as
+    // four rows.
+    px_valid: u1,
+    px_data: u32,
+    // The last row of the frame has been output.
+    frame_done: u1,
+) {
+    // ── macroblock ──
+    let active: u1;
+    let cur: MbHeader;
+    let bank: u1;
+    let mbx: u7;
+    let mby: u11;
+    let has_y2 = (cur.y_mode != 4) & !cur.skip;
+    let b_pred = cur.y_mode == 4;
+    let has_above = mby != 0;
+    let has_left = mbx != 0;
+    mb.ready = !active;
+
+    // ── coefficients ──
+    let rd_re: u1;
+    let rd_addr: u8;
+    let rd_eob_addr: u6;
+    let cbuf = CoeffBuf(coef, rd_re, rd_addr, rd_eob_addr);
+
+    // ── transpose buffers, filled by the front, emptied by the back ──
+    let t: [[[u16; 4]; 4]; 2];
+    let t_full: [u1; 2];
+    let t_blk: [u5; 2];
+
+    // DC of each luma block, from the Y2 block.
+    let dc: [u16; 16];
+    let dc_ready: u1;
+
+    // ── front: one coefficient column per cycle ──
+    let f_run: u1;
+    let f_blk: u5;
+    let f_col: u2;
+    let f_sel: u1;
+    // The column read in the previous cycle.
+    let d_valid: u1;
+    let d_blk: u5;
+    let d_col: u2;
+    let d_sel: u1;
+    let luma = f_blk < 16;
+    let f_go = f_run & !t_full[f_sel] & !(luma & has_y2 & !dc_ready);
+    rd_re = f_go;
+    rd_addr = cat(bank, f_blk, f_col);
+    rd_eob_addr = cat(bank, f_blk);
+    d_valid <= f_go;
+    if f_go {
+        d_blk <= f_blk;
+        d_col <= f_col;
+        d_sel <= f_sel;
+        f_col <= f_col + 1;
+        if f_col == 3 {
+            f_sel <= !f_sel;
+            f_blk <= if f_blk == 24 { 0 } else { f_blk + 1 };
+            if f_blk == 23 {
+                f_run <= 0;
+            }
+        }
+    }
+    // Coefficients of the column: zero at and past the end of block, and before the
+    // first position (the DC of luma blocks with Y2, which comes from Y2).
+    let first: u4 = if has_y2 & (d_blk < 16) { 1 } else { 0 };
+    let column: [u16; 4];
+    for r in 0..4 {
+        let zz = InvZigzag(cat(r as u2, d_col)).zz;
+        let coded = !cur.skip & (zz >= first) & ((zz as u5) < cbuf.eob);
+        column[r] = if coded { cbuf.col[r] } else { 0 };
+    }
+    if has_y2 & (d_blk < 16) & (d_col == 0) {
+        column[0] = dc[d_blk[0..4]];
+    }
+    // The masked column, one cycle later, goes through the vertical transform.
+    let v_valid: u1;
+    let v_blk: u5;
+    let v_col: u2;
+    let v_sel: u1;
+    let v_column: [u16; 4];
+    v_valid <= d_valid;
+    v_blk <= d_blk;
+    v_col <= d_col;
+    v_sel <= d_sel;
+    v_column <= column;
+    let vidct = Idct4(v_column);
+    let vwht = Iwht4(v_column);
+    // The transformed column, one cycle later, goes into the transpose buffer. The next
+    // block for the same buffer is read at least five cycles after this one.
+    let w_valid: u1;
+    let w_blk: u5;
+    let w_col: u2;
+    let w_sel: u1;
+    let w_column: [u16; 4];
+    w_valid <= v_valid;
+    w_blk <= v_blk;
+    w_col <= v_col;
+    w_sel <= v_sel;
+    for r in 0..4 {
+        w_column[r] <= if v_blk == 24 { vwht.y[r][0..16] } else { vidct.y[r][0..16] };
+    }
+    if w_valid {
+        for r in 0..4 {
+            t[w_sel][r][w_col] <= w_column[r];
+        }
+        if w_col == 3 {
+            t_full[w_sel] <= 1;
+            t_blk[w_sel] <= w_blk;
+        }
+    }
+
+    // ── edges ──
+    let above_y: [u8; 16];
+    let above_u: [u8; 8];
+    let above_v: [u8; 8];
+    let above_right: [u8; 4];
+    let left_y: [u8; 16];
+    let left_u: [u8; 8];
+    let left_v: [u8; 8];
+    let tl_y: u8;
+    let tl_u: u8;
+    let tl_v: u8;
+    let next_tl_y: u8;
+    let next_tl_u: u8;
+    let next_tl_v: u8;
+    // B_PRED: the right column of the previous sub-block and the top-left pixels saved
+    // before their edge registers were overwritten.
+    let sub_left: [u8; 4];
+    let right_acc: [u8; 3];
+    let above_tl: u8;
+    let left_tl: u8;
+    // Sums for DC prediction.
+    let sum_ay: u12;
+    let sum_ly: u12;
+    let sum_au: u11;
+    let sum_lu: u11;
+    let sum_av: u11;
+    let sum_lv: u11;
+
+    // Line buffer: bottom row of the macroblock row above, four pixels a word. Luma at
+    // 4 * mbx + i, U at 512 + 2 * mbx + i, V at 768 + 2 * mbx + i.
+    let lb_we: u1;
+    let lb_waddr: u10;
+    let lb_wdata: u32;
+    let lb_raddr: u10;
+    let lb_re: u1;
+    let lb = Mem::<W = 32, D = 1024>(lb_we, lb_waddr, lb_wdata, lb_re, lb_raddr);
+    let lb_px: [u8; 4];
+    for i in 0..4 {
+        lb_px[i] = if has_above { lb.rdata[8 * i..8 * i + 8] } else { 127 };
+    }
+
+    // Loading: read `e_k` (0-8) is issued at step k, its data arrives at step k + 1.
+    let e_run: u1;
+    let e_k: u4;
+    let edges_ready: u1;
+    let mbx10 = mbx as u10;
+    lb_re = e_run & (e_k < 9);
+    lb_raddr = match e_k {
+        0 => (mbx10 << 2),
+        1 => (mbx10 << 2) + 1,
+        2 => (mbx10 << 2) + 2,
+        3 => (mbx10 << 2) + 3,
+        4 => (mbx10 << 2) + 4,
+        5 => 512 + (mbx10 << 1),
+        6 => 513 + (mbx10 << 1),
+        7 => 768 + (mbx10 << 1),
+        _ => 769 + (mbx10 << 1),
+    };
+    let lsum: [u8; 4];
+    for i in 0..4 {
+        lsum[i] = match e_k {
+            0 => left_y[i],
+            1 => left_y[4 + i],
+            2 => left_y[8 + i],
+            3 => left_y[12 + i],
+            4 => left_u[i],
+            5 => left_u[4 + i],
+            6 => left_v[i],
+            _ => left_v[4 + i],
+        };
+    }
+    let ls = Sum4(lsum).s;
+    let as4 = Sum4(lb_px).s;
+    if e_run {
+        e_k <= e_k + 1;
+        match e_k {
+            0 | 1 | 2 | 3 => sum_ly <= sum_ly + (ls as u12),
+            4 | 5 => sum_lu <= sum_lu + (ls as u11),
+            6 | 7 => sum_lv <= sum_lv + (ls as u11),
+            _ => {},
+        }
+        let d = e_k - 1;
+        if e_k != 0 {
+            match d {
+                0 | 1 | 2 | 3 => {
+                    for i in 0..4 {
+                        above_y[4 * d + i] <= lb_px[i];
+                    }
+                    sum_ay <= sum_ay + (as4 as u12);
+                    if d == 3 {
+                        next_tl_y <= lb_px[3];
+                    }
+                },
+                4 => {
+                    // At the right edge of the frame, the last pixel above repeats.
+                    for i in 0..4 {
+                        above_right[i] <= if has_above & (mbx == mb_w - 1) { above_y[15] } else { lb_px[i] };
+                    }
+                },
+                5 | 6 => {
+                    for i in 0..4 {
+                        above_u[4 * (d - 5) + i] <= lb_px[i];
+                    }
+                    sum_au <= sum_au + (as4 as u11);
+                    next_tl_u <= lb_px[3];
+                },
+                _ => {
+                    for i in 0..4 {
+                        above_v[4 * (d - 7) + i] <= lb_px[i];
+                    }
+                    sum_av <= sum_av + (as4 as u11);
+                    next_tl_v <= lb_px[3];
+                },
+            }
+        }
+        if e_k == 9 {
+            e_run <= 0;
+            edges_ready <= 1;
+        }
+    }
+
+    // DC predictions.
+    let dc_y = if has_above & has_left {
+        ((sum_ay as u13) + (sum_ly as u13) + 16)[5..13]
+    } else if has_above {
+        (sum_ay + 8)[4..12]
+    } else if has_left {
+        (sum_ly + 8)[4..12]
+    } else {
+        128
+    };
+    let dc_u = DcChroma(sum_au, sum_lu, has_above, has_left).dc;
+    let dc_v = DcChroma(sum_av, sum_lv, has_above, has_left).dc;
+
+    // ── back, stage 1: a row of the transpose buffer, then its horizontal transform ──
+    let r_sel: u1;
+    let r_row: u2;
+    let x_valid: u1;
+    let x_blk: u5;
+    let x_row: u2;
+    let x_data: [u16; 4];
+    let x_y2 = x_blk == 24;
+    let hidct = Idct4::<R = 4>(x_data);
+    let hwht = Iwht4(x_data);
+    // The residual row waiting for stage 2, with its sub-block mode.
+    let q_valid: u1;
+    let q_blk: u5;
+    let q_row: u2;
+    let q_mode: u4;
+    let resid: [u16; 4];
+    // The block's position, decoded in stage 1.
+    let q_plane: u2;
+    let bx: u2;
+    let by: u2;
+    let x_at = BlockPos(x_blk);
+
+    // ── back, stage 2: prediction of the row ──
+    // The predicted row waiting for stage 3.
+    let s_valid: u1;
+    let s_blk: u5;
+    let s_row: u2;
+    let s_resid: [u16; 4];
+    let s_pred: [u8; 4];
+    let out_free = !px_valid | px_ready;
+    let a_go = s_valid & out_free;
+    // B_PRED: a sub-block's first row needs the right column of the previous one,
+    // whose last row must have left stage 3.
+    let wait_left = b_pred & (q_plane == 0) & (q_row == 0) & s_valid;
+    let p_go = q_valid & edges_ready & (!s_valid | a_go) & !wait_left;
+    let x_go = x_valid & (x_y2 | !q_valid | p_go);
+    let h_go = t_full[r_sel] & (!x_valid | x_go);
+
+    let row4 = cat(by, q_row);
+    let bx4 = cat(bx, 0u2);
+    let above4: [u8; 4];
+    let above8: [u8; 8];
+    for c in 0..4 {
+        above4[c] = match q_plane {
+            0 => above_y[bx4 + c],
+            1 => above_u[bx4 + c],
+            _ => above_v[bx4 + c],
+        };
+        above8[c] = above_y[bx4 + c];
+        above8[4 + c] = if bx == 3 { above_right[c] } else { above_y[bx4 + 4 + c] };
+    }
+    let left1 = match q_plane {
+        0 => left_y[row4],
+        1 => left_u[row4],
+        _ => left_v[row4],
+    };
+    let sub_l: [u8; 4];
+    for i in 0..4 {
+        sub_l[i] = if bx == 0 { left_y[cat(by, 0u2) + i] } else { sub_left[i] };
+    }
+    let sub_p = if bx != 0 { above_tl } else if by == 0 { tl_y } else { left_tl };
+    let srow = SubRow(q_mode, q_row, above8, sub_l, sub_p);
+    let brow = BlockRow(
+        if q_plane == 0 { cur.y_mode } else { cur.uv_mode as u3 },
+        match q_plane {
+            0 => dc_y,
+            1 => dc_u,
+            _ => dc_v,
+        },
+        above4,
+        left1,
+        match q_plane {
+            0 => tl_y,
+            1 => tl_u,
+            _ => tl_v,
+        },
+    );
+    if p_go {
+        s_blk <= q_blk;
+        s_row <= q_row;
+        s_resid <= resid;
+        for c in 0..4 {
+            s_pred[c] <= if b_pred & (q_plane == 0) { srow.px[c] } else { brow.px[c] };
+        }
+    }
+    if p_go {
+        s_valid <= 1;
+    } else if a_go {
+        s_valid <= 0;
+    }
+
+    // ── back, stage 3: residual added, output of the row ──
+    let a_at = BlockPos(s_blk);
+    let a_bx = a_at.bx;
+    let a_row4 = cat(a_at.by, s_row);
+    let a_bx4 = cat(a_bx, 0u2);
+    let pix: [u8; 4];
+    for c in 0..4 {
+        pix[c] = AddClamp(s_pred[c], s_resid[c]).v;
+    }
+
+    // Line buffer writes: the bottom row of the macroblock.
+    let bottom = if a_at.plane == 0 { a_at.by == 3 } else { a_at.by == 1 };
+    lb_we = a_go & bottom & (s_row == 3);
+    lb_waddr = match a_at.plane {
+        0 => (mbx10 << 2) + (a_bx as u10),
+        1 => 512 + (mbx10 << 1) + (a_bx as u10),
+        _ => 768 + (mbx10 << 1) + (a_bx as u10),
+    };
+    lb_wdata = cat(pix[3], pix[2], pix[1], pix[0]);
+
+    if px_valid & px_ready {
+        px_valid <= 0;
+    }
+    frame_done = false;
+    let mb_end = a_go & (s_blk == 23) & (s_row == 3);
+
+    if h_go {
+        r_row <= r_row + 1;
+        if r_row == 3 {
+            t_full[r_sel] <= 0;
+            r_sel <= !r_sel;
+        }
+        x_blk <= t_blk[r_sel];
+        x_row <= r_row;
+        x_data <= t[r_sel][r_row];
+    }
+    if h_go {
+        x_valid <= 1;
+    } else if x_go {
+        x_valid <= 0;
+    }
+    if x_go {
+        if x_y2 {
+            for c in 0..4 {
+                dc[cat(x_row, 0u2) + c] <= (hwht.y[c] + 3)[3..19];
+            }
+            if x_row == 3 {
+                dc_ready <= 1;
+            }
+        } else {
+            q_blk <= x_blk;
+            q_row <= x_row;
+            q_mode <= cur.b_modes[x_blk[0..4]];
+            q_plane <= x_at.plane;
+            bx <= x_at.bx;
+            by <= x_at.by;
+            for c in 0..4 {
+                resid[c] <= hidct.y[c][3..19];
+            }
+        }
+    }
+    if x_go & !x_y2 {
+        q_valid <= 1;
+    } else if p_go {
+        q_valid <= 0;
+    }
+
+    if a_go {
+        px_valid <= 1;
+        px_data <= cat(pix[3], pix[2], pix[1], pix[0]);
+        // The right column becomes the left edge of the next macroblock.
+        let right = a_bx == (if a_at.plane == 0 { 3 } else { 1 });
+        if right {
+            match a_at.plane {
+                0 => left_y[a_row4] <= pix[3],
+                1 => left_u[a_row4] <= pix[3],
+                _ => left_v[a_row4] <= pix[3],
+            }
+            if (a_at.plane == 0) & (s_row == 3) {
+                left_tl <= left_y[a_row4];
+            }
+        }
+        // B_PRED: edges inside the macroblock.
+        if b_pred & (a_at.plane == 0) {
+            if s_row == 3 {
+                for c in 0..4 {
+                    above_y[a_bx4 + c] <= pix[c];
+                }
+                above_tl <= above_y[a_bx4 + 3];
+                for i in 0..3 {
+                    sub_left[i] <= right_acc[i];
+                }
+                sub_left[3] <= pix[3];
+            } else {
+                right_acc[s_row] <= pix[3];
+            }
+        }
+    }
+
+    // ── macroblock sequence ──
+    if mb.valid & !active {
+        cur <= mb.hdr;
+        active <= 1;
+        f_run <= 1;
+        f_blk <= if (mb.hdr.y_mode != 4) & !mb.hdr.skip { 24 } else { 0 };
+        f_col <= 0;
+        dc_ready <= 0;
+        e_run <= 1;
+        e_k <= 0;
+        edges_ready <= 0;
+        sum_ay <= 0;
+        sum_ly <= 0;
+        sum_au <= 0;
+        sum_lu <= 0;
+        sum_av <= 0;
+        sum_lv <= 0;
+        // Top-left pixels: 127 above the frame, 129 left of it.
+        tl_y <= if !has_above { 127 } else if !has_left { 129 } else { next_tl_y };
+        tl_u <= if !has_above { 127 } else if !has_left { 129 } else { next_tl_u };
+        tl_v <= if !has_above { 127 } else if !has_left { 129 } else { next_tl_v };
+        if !has_left {
+            for i in 0..16 {
+                left_y[i] <= 129;
+            }
+            for i in 0..8 {
+                left_u[i] <= 129;
+                left_v[i] <= 129;
+            }
+        }
+    }
+    if mb_end {
+        active <= 0;
+        bank <= !bank;
+        if mbx == mb_w - 1 {
+            mbx <= 0;
+            if mby == mb_h - 1 {
+                mby <= 0;
+                bank <= 0;
+                frame_done = true;
+            } else {
+                mby <= mby + 1;
+            }
+        } else {
+            mbx <= mbx + 1;
+        }
+    }
+}
+
+// DC prediction of an 8x8 chroma block from the sums of its edges.
+module DcChroma(above: u11, left: u11, has_above: u1, has_left: u1) -> (dc: u8) {
+    dc = if has_above & has_left {
+        ((above as u12) + (left as u12) + 8)[4..12]
+    } else if has_above {
+        (above + 4)[3..11]
+    } else if has_left {
+        (left + 4)[3..11]
+    } else {
+        128
+    };
+}

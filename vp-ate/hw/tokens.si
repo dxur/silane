@@ -1,0 +1,600 @@
+// Partition 1: the residual tokens of every macroblock (RFC 6386, section 13),
+// decoded at one bool per cycle into the coefficient buffer.
+
+import "bool_decoder.si";
+import "headers.si";
+import "std:mem";
+
+// A write into the coefficient buffer. The buffer has two banks of 25 blocks (0-15
+// luma, 16-19 U, 20-23 V, 24 Y2) and one RAM per coefficient row, addressed by
+// (bank, block, column). Every position before a block's `eob` (in zigzag order) is
+// written, zero or not; the rest are zero.
+module CoeffWrite -> (we: u1, row: u2, addr: u8, data: u16, eob_we: u1, eob_addr: u6, eob: u5);
+
+// A macroblock whose coefficients are in the buffer. Banks alternate, starting at 0.
+module MbInfo(ready: u1) -> (valid: u1, hdr: MbHeader);
+
+// Token probabilities of one (plane, band) = `raddr`, for all three contexts. Written
+// one context at a time by the frame header.
+module ProbRam<D = 32>(
+    we: u1,
+    waddr: u<max(clog2(D), 1)>,
+    wctx: u2,
+    wdata: [u8; 11],
+    re: u1,
+    raddr: u<max(clog2(D), 1)>,
+) -> (probs: [[u8; 11]; 3]) {
+    for c in 0..3 {
+        let w = we & (wctx == c);
+        let lo = Mem::<W = 48, D = D>(
+            w, waddr, cat(wdata[5], wdata[4], wdata[3], wdata[2], wdata[1], wdata[0]), re, raddr,
+        );
+        let hi = Mem::<W = 40, D = D>(
+            w, waddr, cat(wdata[10], wdata[9], wdata[8], wdata[7], wdata[6]), re, raddr,
+        );
+        for k in 0..6 {
+            probs[c][k] = lo.rdata[8 * k..8 * k + 8];
+        }
+        for k in 0..5 {
+            probs[c][6 + k] = hi.rdata[8 * k..8 * k + 8];
+        }
+    }
+}
+
+enum TState {
+    Idle,
+    // Waiting for a header; the previous macroblock must have been taken.
+    MbWait,
+    // Reads the context of the macroblock and the probabilities of its first block.
+    MbStart,
+    MbLoad,
+    // Walks the token tree.
+    Tok,
+    // Extra bits of a DCT_CAT token.
+    Extra,
+    Sign,
+    MbDone,
+    // Consumes the rest of the partition.
+    Drain,
+}
+
+module Tokens(
+    p1_valid: u1,
+    p1_data: u8,
+    p1_last: u1,
+    info_valid: u1,
+    mb_w: u7,
+    mb_h: u11,
+    quant: Quant,
+    prob_we: u1,
+    prob_addr: u5,
+    prob_ctx: u2,
+    prob_data: [u8; 11],
+    hdr_valid: u1,
+    hdr: MbHeader,
+) -> (
+    p1_ready: u1,
+    hdr_ready: u1,
+    coef: CoeffWrite,
+    mb: MbInfo,
+) {
+    let state: TState reset TState::Idle;
+    let cur: MbHeader;
+    let bank: u1;
+    let blk: u5;
+    let pos: u5;
+    let node: u5;
+    // Context of the next token: 0 after DCT_0, 1 after a one, 2 otherwise.
+    let tctx: u2;
+    // Probabilities of the current token, and of the next bool.
+    let pv: [u8; 11];
+    let prob: u8;
+    let cat_k: u3;
+    let extra_n: u4;
+    let mag: u12;
+    let mbx: u7;
+    let mby: u11;
+    let saw_last: u1;
+
+    // ── bool decoder ──
+    // Every value that depends on the decoded bit is computed for both outcomes from
+    // registers, so the bit only selects; the probability is a register.
+    let bd: BoolDecoder;
+    let bd_clear: u1;
+    let req: u1;
+    bd.clear = bd_clear;
+    bd.in_valid = p1_valid & (state != TState::Drain);
+    bd.in_data = p1_data;
+    bd.in_last = p1_last;
+    bd.req = req;
+    bd.prob = prob;
+    let take = req & bd.ready;
+    let bit = bd.bit;
+    p1_ready = if state == TState::Drain { !saw_last } else { bd.in_ready };
+    if p1_valid & p1_ready & p1_last {
+        saw_last <= 1;
+    }
+
+    // ── blocks: Y2 (unless B_PRED), Y 0-15, U 16-19, V 20-23 ──
+    let has_y2 = cur.y_mode != B_PRED;
+    let this = BlockPlane(blk, has_y2);
+    let next_blk = if blk == 24 { 0 } else { blk + 1 };
+    let next = BlockPlane(next_blk, has_y2);
+    let first_pos = this.first as u5;
+
+    // ── non-zero context: of the blocks above (per column) and to the left ──
+    let above_nz: u9;
+    let left_nz: u9;
+    let nz_we: u1;
+    let nz_mem = Mem::<W = 9, D = 128>(nz_we, mbx, above_nz, state == TState::MbWait, mbx);
+    let bits = NzBits(blk);
+    let nbits = NzBits(next_blk);
+    // The context words after the current block ends, empty (0) or not (1), and the
+    // context of the next block's first token.
+    let above_end: [u9; 2];
+    let left_end: [u9; 2];
+    let ctx_end: [u2; 2];
+    for e in 0..2 {
+        above_end[e] = (above_nz & !(1u9 << bits.above)) | ((e as u9) << bits.above);
+        left_end[e] = (left_nz & !(1u9 << bits.left)) | ((e as u9) << bits.left);
+        ctx_end[e] = ((above_end[e] >> nbits.above)[0] as u2) + ((left_end[e] >> nbits.left)[0] as u2);
+    }
+    // Above the frame, the context is zero.
+    let mb_above = if mby == 0 { 0 } else { nz_mem.rdata };
+
+    // ── probabilities ──
+    // `pram` reads the position after the current one, or the one after that while a
+    // DCT_0 (whose successor starts at node 2, and may take a single bool) is possible:
+    // when a token ends, the next position's probabilities are already there.
+    let in_tok = state == TState::Tok;
+    let ahead = pos[0..4] + (if in_tok & (node == 2) { 2u4 } else { 1 });
+    let pram = ProbRam(prob_we, prob_addr, prob_ctx, prob_data, take, cat(this.plane, Band(ahead).band));
+    // `fram` holds the first position of each plane (band 1 of plane 0, band 0 of the
+    // others) and reads the one of the next block, or of the current one in MbStart.
+    let first_band = if prob_addr[3..5] == 0 { 1u3 } else { 0 };
+    let fram = ProbRam::<D = 4>(
+        prob_we & (prob_addr[0..3] == first_band), prob_addr[3..5], prob_ctx, prob_data,
+        true, if state == TState::MbStart { this.plane } else { next.plane },
+    );
+    // `fram` lags a cycle behind a change of plane.
+    let fram_plane: u2;
+    fram_plane <= if state == TState::MbStart { this.plane } else { next.plane };
+    let fram_ok = fram_plane == next.plane;
+
+    // ── dequantization ──
+    let dc_q = match this.plane {
+        1 => quant.y2_dc,
+        2 => quant.uv_dc,
+        _ => quant.y_dc,
+    };
+    let ac_q = match this.plane {
+        1 => quant.y2_ac,
+        2 => quant.uv_ac,
+        _ => quant.y_ac,
+    };
+    let q = if pos == 0 { dc_q } else { ac_q };
+    let product = (mag as u16) * (q as u16);
+
+    // ── both outcomes of the bool ──
+    let st0 = TokStep(
+        0, state, node, pos, first_pos, pv, tctx, cat_k, extra_n, mag, product, pram.probs,
+        fram.probs, blk, next_blk, next.first, above_nz, left_nz, above_end, left_end, ctx_end,
+    );
+    let st1 = TokStep(
+        1, state, node, pos, first_pos, pv, tctx, cat_k, extra_n, mag, product, pram.probs,
+        fram.probs, blk, next_blk, next.first, above_nz, left_nz, above_end, left_end, ctx_end,
+    );
+
+    // ── outputs ──
+    // Coefficient writes are registered: the bool decisions stay off the buffer's
+    // write port.
+    let cw: CoeffWrite;
+    coef <= cw;
+    let at = Zigzag(pos[0..4]);
+    cw.we = false;
+    cw.row = at.row;
+    cw.addr = cat(bank, blk, at.col);
+    cw.data = 0;
+    cw.eob_we = false;
+    cw.eob_addr = cat(bank, blk);
+    cw.eob = 0;
+    hdr_ready = (state == TState::MbWait) & !mb.valid;
+    mb.hdr = cur;
+
+    req = false;
+    nz_we = false;
+    bd_clear = false;
+
+    match state {
+        TState::Idle => if info_valid & hdr_valid {
+            mbx <= 0;
+            mby <= 0;
+            left_nz <= 0;
+            bank <= 0;
+            state <= TState::MbWait;
+        },
+        TState::MbWait => if hdr_valid & !mb.valid {
+            // `nz_mem` reads this column's context.
+            cur <= hdr;
+            blk <= if hdr.y_mode != B_PRED { 24 } else { 0 };
+            state <= TState::MbStart;
+        },
+        TState::MbStart => {
+            if cur.skip {
+                // No tokens: the context is cleared, except Y2 for a B_PRED
+                // macroblock (which has no Y2 block).
+                let keep: u9 = if has_y2 { 0 } else { 1 };
+                above_nz <= mb_above & keep;
+                left_nz <= left_nz & keep;
+                state <= TState::MbDone;
+            } else {
+                // `fram` reads the first block's probabilities.
+                above_nz <= mb_above;
+                pos <= first_pos;
+                node <= 0;
+                state <= TState::MbLoad;
+            }
+        },
+        TState::MbLoad => {
+            let ctx = ((above_nz >> bits.above)[0] as u2) + ((left_nz >> bits.left)[0] as u2);
+            for k in 0..11 {
+                pv[k] <= fram.probs[ctx][k];
+            }
+            prob <= fram.probs[ctx][0];
+            state <= TState::Tok;
+        },
+        TState::Tok | TState::Extra | TState::Sign => {
+            req = fram_ok;
+            if take {
+                state <= if bit { st1.n_state } else { st0.n_state };
+                node <= if bit { st1.n_node } else { st0.n_node };
+                pos <= if bit { st1.n_pos } else { st0.n_pos };
+                tctx <= if bit { st1.n_tctx } else { st0.n_tctx };
+                prob <= if bit { st1.n_prob } else { st0.n_prob };
+                for k in 0..11 {
+                    pv[k] <= if bit { st1.n_pv[k] } else { st0.n_pv[k] };
+                }
+                cat_k <= if bit { st1.n_cat_k } else { st0.n_cat_k };
+                extra_n <= if bit { st1.n_extra_n } else { st0.n_extra_n };
+                mag <= if bit { st1.n_mag } else { st0.n_mag };
+                blk <= if bit { st1.n_blk } else { st0.n_blk };
+                above_nz <= if bit { st1.n_above_nz } else { st0.n_above_nz };
+                left_nz <= if bit { st1.n_left_nz } else { st0.n_left_nz };
+                cw.we = if bit { st1.we } else { st0.we };
+                cw.data = if bit { st1.data } else { st0.data };
+                cw.eob_we = if bit { st1.eob_we } else { st0.eob_we };
+                cw.eob = if bit { st1.eob } else { st0.eob };
+            }
+        },
+        TState::MbDone => if !mb.valid {
+            nz_we = true;
+            mb.valid <= 1;
+            bank <= !bank;
+            if mbx == mb_w - 1 {
+                mbx <= 0;
+                mby <= mby + 1;
+                left_nz <= 0;
+                state <= if mby == mb_h - 1 { TState::Drain } else { TState::MbWait };
+            } else {
+                mbx <= mbx + 1;
+                state <= TState::MbWait;
+            }
+        },
+        TState::Drain => if saw_last {
+            // The bool decoder may read the last byte at any time during the frame,
+            // even before the first macroblock: forget it only here.
+            saw_last <= 0;
+            bd_clear = true;
+            state <= TState::Idle;
+        },
+    }
+
+    if mb.valid & mb.ready {
+        mb.valid <= 0;
+    }
+}
+
+// The state after one bool of value `b` in Tok, Extra or Sign: the token tree, the
+// extra bits, the coefficient write and the end of the block. `rnext` holds the
+// probabilities of the next position, `rfirst` those of the next block's first one.
+module TokStep(
+    b: u1,
+    state: TState,
+    node: u5,
+    pos: u5,
+    first_pos: u5,
+    pv: [u8; 11],
+    tctx: u2,
+    cat_k: u3,
+    extra_n: u4,
+    mag: u12,
+    product: u16,
+    rnext: [[u8; 11]; 3],
+    rfirst: [[u8; 11]; 3],
+    blk: u5,
+    next_blk: u5,
+    next_first: u1,
+    above_nz: u9,
+    left_nz: u9,
+    above_end: [u9; 2],
+    left_end: [u9; 2],
+    ctx_end: [u2; 2],
+) -> (
+    n_state: TState,
+    n_node: u5,
+    n_pos: u5,
+    n_tctx: u2,
+    n_pv: [u8; 11],
+    n_prob: u8,
+    n_cat_k: u3,
+    n_extra_n: u4,
+    n_mag: u12,
+    n_blk: u5,
+    n_above_nz: u9,
+    n_left_nz: u9,
+    we: u1,
+    data: u16,
+    eob_we: u1,
+    eob: u5,
+) {
+    let step = CoeffTree(node, b);
+    let new_cat = (step.token - 5)[0..3];
+    let cat_first = Pcat(new_cat, 0);
+    let pcat = Pcat(cat_k, extra_n);
+    let pcat_next = Pcat(cat_k, extra_n + 1);
+    let bits = cat(mag[0..11], b);
+
+    n_state = state;
+    n_node = node;
+    n_pos = pos;
+    n_tctx = tctx;
+    n_pv = pv;
+    n_prob = pv[step.next[1..5]];
+    n_cat_k = cat_k;
+    n_extra_n = extra_n;
+    n_mag = mag;
+    n_blk = blk;
+    n_above_nz = above_nz;
+    n_left_nz = left_nz;
+    we = false;
+    data = 0;
+    eob_we = false;
+
+    // Set when the current block ends, with its end-of-block position.
+    let ending: u1;
+    let end_pos: u5;
+    ending = false;
+    end_pos = pos;
+
+    match state {
+        TState::Tok => {
+            n_node = step.next;
+            if step.leaf {
+                if step.token == 11 {
+                    ending = true;
+                } else if step.token == 0 {
+                    // DCT_0. The next token starts at node 2: it cannot be an end of
+                    // block.
+                    we = true;
+                    n_tctx = 0;
+                    n_node = 2;
+                    n_pos = pos + 1;
+                    n_pv = rnext[0];
+                    n_prob = rnext[0][1];
+                    if pos == 15 {
+                        ending = true;
+                        end_pos = 16;
+                    }
+                } else if step.token <= 4 {
+                    n_mag = step.token as u12;
+                    n_tctx = if step.token == 1 { 1 } else { 2 };
+                    n_prob = 128;
+                    n_state = TState::Sign;
+                } else {
+                    n_cat_k = new_cat;
+                    n_extra_n = 0;
+                    n_mag = 0;
+                    n_tctx = 2;
+                    n_prob = cat_first.prob;
+                    n_state = TState::Extra;
+                }
+            }
+        },
+        TState::Extra => {
+            n_extra_n = extra_n + 1;
+            n_mag = bits;
+            n_prob = pcat_next.prob;
+            if pcat.last {
+                n_mag = pcat.base + bits;
+                n_prob = 128;
+                n_state = TState::Sign;
+            }
+        },
+        _ => {
+            // Sign.
+            we = true;
+            data = if b { 0 - product } else { product };
+            n_node = 0;
+            n_pos = pos + 1;
+            n_pv = rnext[tctx];
+            n_prob = rnext[tctx][0];
+            n_state = TState::Tok;
+            if pos == 15 {
+                ending = true;
+                end_pos = 16;
+            }
+        },
+    }
+
+    eob = end_pos;
+    let nz = end_pos > first_pos;
+    let ctx = ctx_end[nz];
+    if ending {
+        eob_we = true;
+        n_blk = next_blk;
+        n_above_nz = above_end[nz];
+        n_left_nz = left_end[nz];
+        n_pos = next_first as u5;
+        n_node = 0;
+        n_pv = rfirst[ctx];
+        n_prob = rfirst[ctx][0];
+        n_state = if blk == 23 { TState::MbDone } else { TState::Tok };
+    }
+}
+
+// Token probability set ("plane") of block `blk`, and its first coefficient position.
+module BlockPlane(blk: u5, has_y2: u1) -> (plane: u2, first: u1) {
+    if blk == 24 {
+        plane = 1;
+        first = 0;
+    } else if blk >= 16 {
+        plane = 2;
+        first = 0;
+    } else if has_y2 {
+        plane = 0;
+        first = 1;
+    } else {
+        plane = 3;
+        first = 0;
+    }
+}
+
+// Bits of the non-zero context of block `blk` in the above and left context words:
+// 0 Y2, 1-4 luma columns/rows, 5-6 U, 7-8 V.
+module NzBits(blk: u5) -> (above: u4, left: u4) {
+    if blk == 24 {
+        above = 0;
+        left = 0;
+    } else if blk >= 20 {
+        above = 7 + (blk[0] as u4);
+        left = 7 + (blk[1] as u4);
+    } else if blk >= 16 {
+        above = 5 + (blk[0] as u4);
+        left = 5 + (blk[1] as u4);
+    } else {
+        above = 1 + (blk[0..2] as u4);
+        left = 1 + (blk[2..4] as u4);
+    }
+}
+
+// Coefficient band of zigzag position `pos`.
+module Band(pos: u4) -> (band: u3) {
+    band = match pos {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        3 => 3,
+        4 => 6,
+        5 => 4,
+        6 => 5,
+        15 => 7,
+        _ => 6,
+    };
+}
+
+// Raster row and column of zigzag position `pos`.
+module Zigzag(pos: u4) -> (row: u2, col: u2) {
+    let raster = match pos {
+        0 => 0u4,
+        1 => 1,
+        2 => 4,
+        3 => 8,
+        4 => 5,
+        5 => 2,
+        6 => 3,
+        7 => 6,
+        8 => 9,
+        9 => 12,
+        10 => 13,
+        11 => 10,
+        12 => 7,
+        13 => 11,
+        14 => 14,
+        _ => 15,
+    };
+    row = raster[2..4];
+    col = raster[0..2];
+}
+
+// One step down the token tree (RFC 6386, section 13.2) from node pair `node`: the
+// next node pair, or the leaf token (0-4: DCT_0 to DCT_4, 5-10: DCT_CAT1 to
+// DCT_CAT6, 11: end of block).
+module CoeffTree(node: u5, bit: u1) -> (leaf: u1, next: u5, token: u4) {
+    let entry = match cat(node, bit) {
+        0b000000 => cat(1u1, 11u5),
+        0b000001 => cat(0u1, 2u5),
+        0b000100 => cat(1u1, 0u5),
+        0b000101 => cat(0u1, 4u5),
+        0b001000 => cat(1u1, 1u5),
+        0b001001 => cat(0u1, 6u5),
+        0b001100 => cat(0u1, 8u5),
+        0b001101 => cat(0u1, 12u5),
+        0b010000 => cat(1u1, 2u5),
+        0b010001 => cat(0u1, 10u5),
+        0b010100 => cat(1u1, 3u5),
+        0b010101 => cat(1u1, 4u5),
+        0b011000 => cat(0u1, 14u5),
+        0b011001 => cat(0u1, 16u5),
+        0b011100 => cat(1u1, 5u5),
+        0b011101 => cat(1u1, 6u5),
+        0b100000 => cat(0u1, 18u5),
+        0b100001 => cat(0u1, 20u5),
+        0b100100 => cat(1u1, 7u5),
+        0b100101 => cat(1u1, 8u5),
+        0b101000 => cat(1u1, 9u5),
+        _ => cat(1u1, 10u5),
+    };
+    leaf = entry[5];
+    next = entry[0..5];
+    token = entry[0..4];
+}
+
+// Probability of extra bit `n` of category `k` (0 for DCT_CAT1), whether it is the
+// last one, and the category's base value.
+module Pcat(k: u3, n: u4) -> (prob: u8, last: u1, base: u12) {
+    prob = match cat(k, n) {
+        0b0000000 => 159,
+        0b0010000 => 165,
+        0b0010001 => 145,
+        0b0100000 => 173,
+        0b0100001 => 148,
+        0b0100010 => 140,
+        0b0110000 => 176,
+        0b0110001 => 155,
+        0b0110010 => 140,
+        0b0110011 => 135,
+        0b1000000 => 180,
+        0b1000001 => 157,
+        0b1000010 => 141,
+        0b1000011 => 134,
+        0b1000100 => 130,
+        0b1010000 => 254,
+        0b1010001 => 254,
+        0b1010010 => 243,
+        0b1010011 => 230,
+        0b1010100 => 196,
+        0b1010101 => 177,
+        0b1010110 => 153,
+        0b1010111 => 140,
+        0b1011000 => 133,
+        0b1011001 => 130,
+        _ => 129,
+    };
+    let count = match k {
+        0 => 1u4,
+        1 => 2,
+        2 => 3,
+        3 => 4,
+        4 => 5,
+        _ => 11,
+    };
+    last = n == count - 1;
+    base = match k {
+        0 => 5,
+        1 => 7,
+        2 => 11,
+        3 => 19,
+        4 => 35,
+        _ => 67,
+    };
+}

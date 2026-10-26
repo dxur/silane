@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+
+members = [
+  "crates/silane", "crates/silane-lang", "crates/si-tests", "vp-ate", "rv-olt",
+]
+exclude = ["orbit"]

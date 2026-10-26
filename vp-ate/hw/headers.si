@@ -1,0 +1,602 @@
+// Partition 0: the frame header (RFC 6386, section 9) and the macroblock headers
+// (section 11), parsed from the start of the frame.
+
+import "bool_decoder.si";
+import "std:mem";
+
+extern module CoeffRom(raddr: u11) -> (rdata: u16) = "crate::rtl::CoeffRom";
+extern module QuantRom(raddr: u7) -> (rdata: u27) = "crate::rtl::QuantRom";
+extern module BmodeRom(raddr: u7) -> (lo: u40, hi: u32) = "crate::rtl::BmodeRom";
+
+// Dequantization factors of the frame.
+module Quant -> (y_dc: u9, y_ac: u9, y2_dc: u9, y2_ac: u9, uv_dc: u9, uv_ac: u9);
+
+// Header of one macroblock. `b_modes` are the sub-block modes, or the sub-block mode
+// implied by `y_mode` when it is not B_PRED.
+module MbHeader -> (skip: u1, y_mode: u3, uv_mode: u2, b_modes: [u4; 16]);
+
+const B_PRED = 4;
+
+enum Phase {
+    Tag,
+    // Reads `cnt + 1` bools of probability 1/2 into `acc`, then goes to `ret`.
+    Lit,
+    Seg,
+    LfAdj,
+    LfUpdate,
+    LfDelta,
+    LfDeltaNext,
+    Parts,
+    PartsCheck,
+    QIndex,
+    QDelta,
+    QDeltaValue,
+    QDeltaNext,
+    Refresh,
+    CoefWait,
+    Coef,
+    CoefLit,
+    SkipEnable,
+    SkipProb,
+    QuantAddr,
+    QuantWait,
+    QuantTake,
+    MbStart,
+    Skip,
+    YMode,
+    // Sub-block modes: the probability address, the ROM read, the tree.
+    BAddr,
+    BWait,
+    BMode,
+    UvMode,
+    Push,
+    Drain,
+    Idle,
+    Error,
+}
+
+module Headers(
+    p0_valid: u1,
+    p0_data: u8,
+    // The previous frame has been fully output: the next one may start.
+    frame_done: u1,
+    hdr_ready: u1,
+) -> (
+    p0_ready: u1,
+    // The frame header fields below are valid.
+    info_valid: u1,
+    width: u14,
+    height: u14,
+    mb_w: u7,
+    mb_h: u11,
+    part1_offset: u20,
+    quant: Quant,
+    // Writes the 11 token probabilities of (plane, band) = `prob_addr`, context
+    // `prob_ctx`.
+    prob_we: u1,
+    prob_addr: u5,
+    prob_ctx: u2,
+    prob_data: [u8; 11],
+    hdr_valid: u1,
+    hdr: MbHeader,
+    error: u1,
+) {
+    let phase: Phase reset Phase::Tag;
+    let ret: Phase;
+    let cnt: u4;
+    let acc: u8;
+    let i: u4;
+
+    // ── partition 0 bytes ──
+    let tag: [u8; 10];
+    let part0_len: u19;
+    let bd_count: u19;
+    let bd_clear: u1;
+    let bd: BoolDecoder;
+    let more = bd_count != part0_len;
+    bd.clear = bd_clear;
+    bd.in_valid = p0_valid & more & (phase != Phase::Tag);
+    bd.in_data = p0_data;
+    bd.in_last = bd_count + 1 == part0_len;
+    p0_ready = match phase {
+        Phase::Tag => true,
+        Phase::Drain => more,
+        _ => bd.in_ready & more,
+    };
+    // Bytes of partition 0 taken, by the bool decoder or (at the end) to drain it.
+    if p0_valid & p0_ready & (phase != Phase::Tag) {
+        bd_count <= bd_count + 1;
+    }
+    // The end of the previous frame may come while partition 0 is still draining.
+    let done_seen: u1;
+    if frame_done {
+        done_seen <= 1;
+    }
+
+    // ── bool requests ──
+    // Each bool takes two cycles: the first registers the probability (cutting the
+    // long path from the tables to the decoder), the second decodes.
+    let req: u1;
+    let prob: u8;
+    let prob_r: u8;
+    let armed: u1;
+    bd.req = req & armed;
+    bd.prob = prob_r;
+    let take = req & armed & bd.ready;
+    prob_r <= prob;
+    armed <= req & !take;
+    let bit = bd.bit;
+    req = false;
+    prob = 128;
+
+    // Starts a literal of `n` bits, continuing at `next`.
+    // (Written out at every use: cnt <= n - 1; ret <= next; phase <= Phase::Lit.)
+
+    // ── frame header state ──
+    let q_index: u7;
+    let deltas: [u5; 5];
+    let skip_enabled: u1;
+    let skip_prob: u8;
+    let quant_j: u3;
+
+    // Coefficient probability updates: entry `coef_idx` of the ROMs is (plane, band,
+    // ctx, node).
+    let coef_idx: u11;
+    let plane: u2;
+    let band: u3;
+    let ctx: u2;
+    let node: u4;
+    let probs: [u8; 11];
+    let crom = CoeffRom(raddr: coef_idx);
+    let default_prob = crom.rdata[8..16];
+    let update_prob = crom.rdata[0..8];
+
+    // Quantizer lookups: ROM index for lookup `quant_j`.
+    let qrom_addr: u7;
+    let qrom = QuantRom(raddr: qrom_addr);
+    let rom_dc = qrom.rdata[18..27];
+    let rom_ac = qrom.rdata[9..18];
+    let rom_y2ac = qrom.rdata[0..9];
+
+    // ── macroblock header state ──
+    let mbx: u7;
+    let mby: u11;
+    let tree: u5;
+    let b: u4;
+    let modes: [u4; 16];
+    let left_modes: [u4; 4];
+    // Bottom-row sub-block modes of the macroblock above, per column.
+    let above_we: u1;
+    let above_mem = Mem::<W = 16, D = 128>(
+        we: above_we,
+        waddr: mbx,
+        wdata: cat(modes[15], modes[14], modes[13], modes[12]),
+        re: phase == Phase::MbStart,
+        raddr: mbx,
+    );
+    let brom_addr: u7;
+    let brom = BmodeRom(raddr: brom_addr);
+    // Probability of tree node pair `n`.
+    let bn = tree[1..5];
+    let bprob = if bn < 5 {
+        (brom.lo >> (cat(bn[0..3], 0u3) as u6))[0..8]
+    } else {
+        (brom.hi >> (cat((bn - 5)[0..2], 0u3) as u5))[0..8]
+    };
+    // Sub-block mode decoding: one tree step, and the probability address of sub-block
+    // `b`, from registers. Its context is the sub-block above (inside this macroblock or
+    // the one above it) and the one to its left (inside this macroblock or the one to
+    // its left).
+    let step = BmodeTree(tree, bd.bit);
+    let above_b = if b >= 4 {
+        modes[b - 4]
+    } else {
+        (above_mem.rdata >> (cat(b[0..2], 0u2) as u5))[0..4]
+    };
+    let left_b = if b[0..2] == 0 { left_modes[b[2..4]] } else { modes[b - 1] };
+    let b_addr = BmodeAddr(above_b, left_b).addr;
+    // Whether the coefficient probability being stored was read as a literal.
+    let coef_lit: u1;
+
+    above_we = false;
+    prob_we = false;
+    prob_addr = cat(plane, band);
+    prob_ctx = ctx;
+    for k in 0..10 {
+        prob_data[k] = probs[k];
+    }
+    prob_data[10] = if coef_lit { acc } else { default_prob };
+    bd_clear = false;
+    error = phase == Phase::Error;
+    hdr_valid = phase == Phase::Push;
+
+    match phase {
+        Phase::Tag => if p0_valid {
+            tag[i] <= p0_data;
+            i <= i + 1;
+            if i == 9 {
+                let t = cat(tag[2], tag[1], tag[0]);
+                let size = cat(p0_data, tag[8], tag[7], tag[6]);
+                let w = size[0..14];
+                let h = size[16..30];
+                let bad_code = (tag[3] != 0x9d) | (tag[4] != 0x01) | (tag[5] != 0x2a);
+                // Not a key frame, unknown version, bad start code, or too wide.
+                if t[0] | (t[1..4] > 3) | bad_code | (w > 1920) | (w == 0) | (h == 0) | (t[5..24] == 0) {
+                    phase <= Phase::Error;
+                } else {
+                    part0_len <= t[5..24];
+                    width <= w;
+                    height <= h;
+                    mb_w <= (w + 15)[4..11];
+                    mb_h <= ((h as u15) + 15)[4..15];
+                    // Colour space and clamping type, then segmentation.
+                    cnt <= 1;
+                    ret <= Phase::Seg;
+                    phase <= Phase::Lit;
+                }
+            }
+        },
+        Phase::Lit => {
+            req = true;
+            if take {
+                acc <= cat(acc[0..7], bit);
+                cnt <= cnt - 1;
+                if cnt == 0 {
+                    phase <= ret;
+                }
+            }
+        },
+        Phase::Seg => {
+            req = true;
+            if take {
+                if bit {
+                    phase <= Phase::Error;
+                } else {
+                    // Filter type, level and sharpness: unused, as there is no loop
+                    // filter.
+                    cnt <= 9;
+                    ret <= Phase::LfAdj;
+                    phase <= Phase::Lit;
+                }
+            }
+        },
+        Phase::LfAdj => {
+            req = true;
+            if take {
+                phase <= if bit { Phase::LfUpdate } else { Phase::Parts };
+            }
+        },
+        Phase::LfUpdate => {
+            req = true;
+            if take {
+                i <= 0;
+                phase <= if bit { Phase::LfDelta } else { Phase::Parts };
+            }
+        },
+        Phase::LfDelta => {
+            // Eight optional deltas of six bits and a sign. Unused: there is no loop
+            // filter.
+            req = true;
+            if take {
+                if bit {
+                    cnt <= 6;
+                    ret <= Phase::LfDeltaNext;
+                    phase <= Phase::Lit;
+                } else {
+                    phase <= Phase::LfDeltaNext;
+                }
+            }
+        },
+        Phase::LfDeltaNext => {
+            i <= i + 1;
+            phase <= if i == 7 { Phase::Parts } else { Phase::LfDelta };
+        },
+        Phase::Parts => {
+            cnt <= 1;
+            ret <= Phase::PartsCheck;
+            phase <= Phase::Lit;
+        },
+        Phase::PartsCheck => {
+            // Only one token partition is supported.
+            if acc[0..2] != 0 {
+                phase <= Phase::Error;
+            } else {
+                cnt <= 6;
+                ret <= Phase::QIndex;
+                phase <= Phase::Lit;
+            }
+        },
+        Phase::QIndex => {
+            q_index <= acc[0..7];
+            i <= 0;
+            phase <= Phase::QDelta;
+        },
+        Phase::QDelta => {
+            // Five optional deltas of four bits and a sign.
+            req = true;
+            if take {
+                if bit {
+                    cnt <= 4;
+                    ret <= Phase::QDeltaValue;
+                    phase <= Phase::Lit;
+                } else {
+                    deltas[i] <= 0;
+                    phase <= Phase::QDeltaNext;
+                }
+            }
+        },
+        Phase::QDeltaValue => {
+            // Four bits of magnitude, then the sign.
+            let mag = acc[1..5] as u5;
+            deltas[i] <= if acc[0] { 0 - mag } else { mag };
+            phase <= Phase::QDeltaNext;
+        },
+        Phase::QDeltaNext => {
+            i <= i + 1;
+            phase <= if i == 4 { Phase::Refresh } else { Phase::QDelta };
+        },
+        Phase::Refresh => {
+            req = true;
+            if take {
+                coef_idx <= 0;
+                plane <= 0;
+                band <= 0;
+                ctx <= 0;
+                node <= 0;
+                phase <= Phase::CoefWait;
+            }
+        },
+        Phase::CoefWait => phase <= Phase::Coef,
+        Phase::Coef => {
+            req = true;
+            prob = update_prob;
+            if take {
+                coef_lit <= bit;
+                if bit {
+                    cnt <= 7;
+                    ret <= Phase::CoefLit;
+                    phase <= Phase::Lit;
+                } else {
+                    phase <= Phase::CoefLit;
+                }
+            }
+        },
+        Phase::CoefLit => {
+            // Stores the probability: the literal just read, or the default.
+            probs[node] <= prob_data[10];
+            node <= node + 1;
+            if node == 10 {
+                prob_we = true;
+                node <= 0;
+                ctx <= ctx + 1;
+                if ctx == 2 {
+                    ctx <= 0;
+                    band <= band + 1;
+                    if band == 7 {
+                        plane <= plane + 1;
+                    }
+                }
+            }
+            coef_idx <= coef_idx + 1;
+            phase <= if coef_idx == 1055 { Phase::SkipEnable } else { Phase::CoefWait };
+        },
+        Phase::SkipEnable => {
+            req = true;
+            if take {
+                skip_enabled <= bit;
+                if bit {
+                    cnt <= 7;
+                    ret <= Phase::SkipProb;
+                    phase <= Phase::Lit;
+                } else {
+                    quant_j <= 0;
+                    phase <= Phase::QuantAddr;
+                }
+            }
+        },
+        Phase::SkipProb => {
+            skip_prob <= acc;
+            quant_j <= 0;
+            phase <= Phase::QuantAddr;
+        },
+        Phase::QuantAddr => {
+            // Index q + delta, clamped to 0..=127. Lookup 0 is the luma AC factor,
+            // which has no delta; lookups 1-5 use deltas 0-4.
+            let d = if quant_j == 0 { 0 } else { deltas[quant_j - 1] };
+            let sum = (q_index as u9) + cat(rep(d[4], 4), d);
+            qrom_addr <= if sum[8] { 0 } else if sum[7] { 127 } else { sum[0..7] };
+            phase <= Phase::QuantWait;
+        },
+        Phase::QuantWait => phase <= Phase::QuantTake,
+        Phase::QuantTake => {
+            match quant_j {
+                0 => quant.y_ac <= rom_ac,
+                1 => quant.y_dc <= rom_dc,
+                2 => quant.y2_dc <= cat(rom_dc[0..8], 0u1),
+                3 => quant.y2_ac <= rom_y2ac,
+                4 => quant.uv_dc <= if rom_dc > 132 { 132 } else { rom_dc },
+                _ => quant.uv_ac <= rom_ac,
+            }
+            quant_j <= quant_j + 1;
+            if quant_j == 5 {
+                info_valid <= 1;
+                mbx <= 0;
+                mby <= 0;
+                for k in 0..4 {
+                    left_modes[k] <= 0;
+                }
+                phase <= Phase::MbStart;
+            } else {
+                phase <= Phase::QuantAddr;
+            }
+        },
+        Phase::MbStart => {
+            // `above_mem` reads this column's context.
+            phase <= Phase::Skip;
+        },
+        Phase::Skip => {
+            tree <= 0;
+            if skip_enabled {
+                req = true;
+                prob = skip_prob;
+                if take {
+                    hdr.skip <= bit;
+                    phase <= Phase::YMode;
+                }
+            } else {
+                hdr.skip <= 0;
+                phase <= Phase::YMode;
+            }
+        },
+        Phase::YMode => {
+            // Key-frame luma mode tree: B_PRED | ((DC | V) | (H | TM)).
+            req = true;
+            prob = match tree[1..3] {
+                0 => 145,
+                1 => 156,
+                2 => 163,
+                _ => 128,
+            };
+            if take {
+                // Inner nodes: 0 -> 2, 2 -> 4 | 6. A leaf resets `tree` below.
+                tree <= if tree == 0 { 2 } else if bit { 6 } else { 4 };
+                let leaf = (tree == 0) & !bit | (tree >= 4);
+                if leaf {
+                    let y_mode = match tree[1..3] {
+                        0 => 4u3,
+                        2 => cat(0u2, bit),
+                        _ => cat(1u2, bit),
+                    };
+                    hdr.y_mode <= y_mode;
+                    tree <= 0;
+                    b <= 0;
+                    // The sub-block mode implied by DC, V, H and TM: B_DC, B_VE,
+                    // B_HE and B_TM.
+                    let implied = match y_mode {
+                        0 => 0u4,
+                        1 => 2,
+                        2 => 3,
+                        _ => 1,
+                    };
+                    for k in 0..16 {
+                        modes[k] <= implied;
+                    }
+                    if y_mode == B_PRED {
+                        phase <= Phase::BAddr;
+                    } else {
+                        phase <= Phase::UvMode;
+                    }
+                }
+            }
+        },
+        Phase::BAddr => {
+            brom_addr <= b_addr;
+            phase <= Phase::BWait;
+        },
+        Phase::BWait => phase <= Phase::BMode,
+        Phase::BMode => {
+            // Sub-block mode tree, with the probabilities of this (above, left).
+            req = true;
+            prob = bprob;
+            if take {
+                tree <= step.next;
+                if step.leaf {
+                    modes[b] <= step.mode;
+                    tree <= 0;
+                    b <= b + 1;
+                    if b == 15 {
+                        phase <= Phase::UvMode;
+                    } else {
+                        phase <= Phase::BAddr;
+                    }
+                }
+            }
+        },
+        Phase::UvMode => {
+            // Chroma mode tree: DC | (V | (H | TM)).
+            req = true;
+            prob = match tree[1..3] {
+                0 => 142,
+                1 => 114,
+                _ => 183,
+            };
+            if take {
+                tree <= tree + 2;
+                if !bit | (tree == 4) {
+                    hdr.uv_mode <= if bit { 3 } else { tree[1..3] };
+                    for k in 0..16 {
+                        hdr.b_modes[k] <= modes[k];
+                    }
+                    phase <= Phase::Push;
+                }
+            }
+        },
+        Phase::Push => if hdr_ready {
+            above_we = true;
+            for k in 0..4 {
+                left_modes[k] <= modes[4 * k + 3];
+            }
+            if mbx == mb_w - 1 {
+                mbx <= 0;
+                mby <= mby + 1;
+                for k in 0..4 {
+                    left_modes[k] <= 0;
+                }
+                phase <= if mby == mb_h - 1 { Phase::Drain } else { Phase::MbStart };
+            } else {
+                mbx <= mbx + 1;
+                phase <= Phase::MbStart;
+            }
+        },
+        Phase::Drain => if !more {
+            phase <= Phase::Idle;
+        },
+        Phase::Idle => if frame_done | done_seen {
+            done_seen <= 0;
+            bd_clear = true;
+            bd_count <= 0;
+            info_valid <= 0;
+            i <= 0;
+            phase <= Phase::Tag;
+        },
+        Phase::Error => {},
+    }
+
+    part1_offset = (part0_len as u20) + 10;
+}
+
+// Address of the sub-block mode probabilities for context (above, left).
+module BmodeAddr(above: u4, left: u4) -> (addr: u7) {
+    let a = above as u7;
+    addr = (a << 3) + (a << 1) + (left as u7);
+}
+
+// One step down the sub-block mode tree (RFC 6386, section 11.2) from node pair
+// `node`: the next node pair, or the leaf mode.
+module BmodeTree(node: u5, bit: u1) -> (leaf: u1, next: u5, mode: u4) {
+    // Leaves: B_DC 0, B_TM 1, B_VE 2, B_HE 3, B_LD 4, B_RD 5, B_VR 6, B_VL 7,
+    // B_HD 8, B_HU 9.
+    let entry = match cat(node, bit) {
+        0b000000 => cat(1u1, 0u5),  // 0: DC
+        0b000001 => cat(0u1, 2u5),
+        0b000100 => cat(1u1, 1u5),  // 2: TM
+        0b000101 => cat(0u1, 4u5),
+        0b001000 => cat(1u1, 2u5),  // 4: VE
+        0b001001 => cat(0u1, 6u5),
+        0b001100 => cat(0u1, 8u5),  // 6
+        0b001101 => cat(0u1, 12u5),
+        0b010000 => cat(1u1, 3u5),  // 8: HE
+        0b010001 => cat(0u1, 10u5),
+        0b010100 => cat(1u1, 5u5),  // 10: RD | VR
+        0b010101 => cat(1u1, 6u5),
+        0b011000 => cat(1u1, 4u5),  // 12: LD
+        0b011001 => cat(0u1, 14u5),
+        0b011100 => cat(1u1, 7u5),  // 14: VL
+        0b011101 => cat(0u1, 16u5),
+        0b100000 => cat(1u1, 8u5),  // 16: HD | HU
+        _ => cat(1u1, 9u5),
+    };
+    leaf = entry[5];
+    next = entry[0..5];
+    mode = entry[0..4];
+}

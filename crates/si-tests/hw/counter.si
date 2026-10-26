@@ -1,0 +1,15 @@
+// A counter with enable and synchronous clear.
+module Counter<W = 8>(en: u1, clear: u1) -> (count: u<W>, wrapped: u1) {
+    let value: u<W>;
+
+    if clear {
+        value <= 0;
+    } else if en {
+        value <= value + 1;
+    }
+
+    count = value;
+    wrapped = en & value.all();
+}
+
+module Counter4 = Counter::<W = 4>;

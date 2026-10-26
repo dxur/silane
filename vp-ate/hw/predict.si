@@ -1,0 +1,142 @@
+// Intra prediction (RFC 6386, section 12), one row of four pixels at a time.
+
+// (x + 2y + z + 2) / 4
+module Avg3(x: u8, y: u8, z: u8) -> (v: u8) {
+    v = ((x as u10) + ((y as u10) << 1) + (z as u10) + 2)[2..10];
+}
+
+// (x + y + 1) / 2
+module Avg2(x: u8, y: u8) -> (v: u8) {
+    v = ((x as u9) + (y as u9) + 1)[1..9];
+}
+
+// `l + a - p`, clamped to 0..=255.
+module Tm(l: u8, a: u8, p: u8) -> (v: u8) {
+    let s = (l as u10) + (a as u10) - (p as u10);
+    // Negative values have bit 9 set; values above 255 have bit 8 set.
+    v = if s[9] { 0 } else if s[8] { 255 } else { s[0..8] };
+}
+
+// Row `r` of a whole-block prediction (DC, V, H or TM) of a 16x16 luma or 8x8 chroma
+// block, at the four columns whose above pixels are `above`.
+module BlockRow(mode: u3, dc: u8, above: [u8; 4], left: u8, top_left: u8) -> (px: [u8; 4]) {
+    for c in 0..4 {
+        px[c] = match mode {
+            0 => dc,
+            1 => above[c],
+            2 => left,
+            _ => Tm(left, above[c], top_left).v,
+        };
+    }
+}
+
+// Row `r` of a 4x4 luma sub-block prediction. `a` holds the four pixels above and the
+// four above-right, `l` the four to the left and `p` the one above-left.
+module SubRow(mode: u4, r: u2, a: [u8; 8], l: [u8; 4], p: u8) -> (px: [u8; 4]) {
+    // The edge from bottom-left to top-right, E[0..13]: L[3], L[2], L[1], L[0], P,
+    // A[0..8]. `a3[i]` averages three pixels around E[i], `a2[i]` E[i] and E[i + 1].
+    let e: [u8; 13];
+    for i in 0..4 {
+        e[i] = l[3 - i];
+    }
+    e[4] = p;
+    for i in 0..8 {
+        e[5 + i] = a[i];
+    }
+    let a3: [u8; 12];
+    a3[0] = 0;
+    for i in 1..12 {
+        a3[i] = Avg3(e[i - 1], e[i], e[i + 1]).v;
+    }
+    let a2: [u8; 9];
+    for i in 0..9 {
+        a2[i] = Avg2(e[i], e[i + 1]).v;
+    }
+    // Pixels past the ends of the edge repeat the last one.
+    let he_last = Avg3(l[2], l[3], l[3]).v;
+    let ld_last = Avg3(a[6], a[7], a[7]).v;
+    let sum = (a[0] as u11) + (a[1] as u11) + (a[2] as u11) + (a[3] as u11)
+        + (l[0] as u11) + (l[1] as u11) + (l[2] as u11) + (l[3] as u11) + 4;
+    let dc = sum[3..11];
+    let left = l[r];
+
+    for c in 0..4 {
+        let col: u4 = c;
+        // Diagonal indices on the edge.
+        let rd = 4 + col - (r as u4);
+        let ld = 6 + col + (r as u4);
+        px[c] = match mode {
+            0 => dc,
+            1 => Tm(left, a[c], p).v,
+            2 => a3[5 + c],
+            3 => if r == 3 { he_last } else { a3[3 - (r as u4)] },
+            4 => if (r as u4) + col == 6 { ld_last } else { a3[ld] },
+            5 => a3[rd],
+            6 => VrPixel(r, col, a3, a2).v,
+            7 => VlPixel(r, col, a3, a2).v,
+            8 => HdPixel(r, col, a3, a2).v,
+            _ => HuPixel(r, col, a3, a2, he_last, l[3]).v,
+        };
+    }
+}
+
+// B_VR_PRED at row `r`, column `c`.
+module VrPixel(r: u2, c: u4, a3: [u8; 12], a2: [u8; 9]) -> (v: u8) {
+    v = match cat(r, c[0..2]) {
+        0b1100 => a3[2],
+        0b1000 => a3[3],
+        0b1101 | 0b0100 => a3[4],
+        0b1001 | 0b0000 => a2[4],
+        0b1110 | 0b0101 => a3[5],
+        0b1010 | 0b0001 => a2[5],
+        0b1111 | 0b0110 => a3[6],
+        0b1011 | 0b0010 => a2[6],
+        0b0111 => a3[7],
+        _ => a2[7],
+    };
+}
+
+// B_VL_PRED at row `r`, column `c`.
+module VlPixel(r: u2, c: u4, a3: [u8; 12], a2: [u8; 9]) -> (v: u8) {
+    v = match cat(r, c[0..2]) {
+        0b0000 => a2[5],
+        0b0100 => a3[6],
+        0b1000 | 0b0001 => a2[6],
+        0b0101 | 0b1100 => a3[7],
+        0b1001 | 0b0010 => a2[7],
+        0b1101 | 0b0110 => a3[8],
+        0b1010 | 0b0011 => a2[8],
+        0b1110 | 0b0111 => a3[9],
+        0b1011 => a3[10],
+        _ => a3[11],
+    };
+}
+
+// B_HD_PRED at row `r`, column `c`.
+module HdPixel(r: u2, c: u4, a3: [u8; 12], a2: [u8; 9]) -> (v: u8) {
+    v = match cat(r, c[0..2]) {
+        0b1100 => a2[0],
+        0b1101 => a3[1],
+        0b1000 | 0b1110 => a2[1],
+        0b1001 | 0b1111 => a3[2],
+        0b1010 | 0b0100 => a2[2],
+        0b1011 | 0b0101 => a3[3],
+        0b0110 | 0b0000 => a2[3],
+        0b0111 | 0b0001 => a3[4],
+        0b0010 => a3[5],
+        _ => a3[6],
+    };
+}
+
+// B_HU_PRED at row `r`, column `c`.
+module HuPixel(r: u2, c: u4, a3: [u8; 12], a2: [u8; 9], he_last: u8, l3: u8) -> (v: u8) {
+    v = match cat(r, c[0..2]) {
+        0b0000 => a2[2],
+        0b0001 => a3[2],
+        0b0010 | 0b0100 => a2[1],
+        0b0011 | 0b0101 => a3[1],
+        0b0110 | 0b1000 => a2[0],
+        0b0111 | 0b1001 => he_last,
+        _ => l3,
+    };
+}

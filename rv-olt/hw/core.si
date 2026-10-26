@@ -1,0 +1,899 @@
+// rv-olt core: RV64IMAFDC (RV64GC) + Zicsr + Zifencei, M/S/U modes, Sv39.
+//
+// A five-stage in-order pipeline:
+//
+//   F  fetch: a one-word fetch buffer, RVC expansion; starts the register reads of
+//      the instruction it hands to D
+//   D  decode: register values (forwarded from W and from the write before it),
+//      load-use stalls; JAL redirects fetch here
+//   X  execute: ALU, branches (predicted not taken; taken branches and JALR redirect
+//      fetch), MUL/DIV and the FPU (multi-cycle, X waits); operands forwarded from M
+//      and W, refreshed every cycle X waits
+//   M  memory, and commit: translation and data accesses, AMOs, LR/SC, CSRs, xRET,
+//      SFENCE.VMA, FENCE.I, WFI; traps and interrupts are taken here, precisely.
+//      Instructions that change state the younger ones depend on (CSR writes, xRET,
+//      fences) flush the pipeline and refetch after themselves.
+//   W  writeback
+//
+// Fetch and data accesses share one TLB lookup port (M first) and the page-table
+// walker, and one memory port: a request/acknowledge bus (hold `mem_req` and its
+// address/data until `mem_ack`; `mem_err` with the ack is an access fault). Data is
+// 64 bits wide and addresses are physical: the word at `mem_addr` (a multiple of 8)
+// is accessed, `mem_be` selecting the bytes read or written. Instructions are only
+// fetched from RAM (from 0x8000_0000) and the boot ROM (0x1000..0x1fff).
+
+import "defs.si";
+import "rvc.si";
+import "decode.si";
+import "alu.si";
+import "muldiv.si";
+import "csr.si";
+import "mmu.si";
+import "fpu.si";
+import "std:mem";
+
+enum FSt { Run, Walk, Mem }
+enum MSt { Run, Walk, Mem, AmoW, Csr, Wfi, Trap }
+
+// `RESET_PC` is where execution starts (the SoC's boot ROM).
+module Core<RESET_PC = 0x1000>(
+    mem_ack: u1,
+    mem_err: u1,
+    mem_rdata: u64,
+    // Interrupt lines (CLINT and PLIC) and the CLINT's time.
+    mtip: u1,
+    msip: u1,
+    meip: u1,
+    seip: u1,
+    mtime: u64,
+) -> (
+    mem_req: u1,
+    mem_addr: u64,
+    mem_we: u1,
+    mem_wdata: u64,
+    mem_be: u8,
+    // Debug: an instruction commits (or traps) this cycle, at `dbg_pc`.
+    dbg_retire: u1,
+    dbg_trap: u1,
+    dbg_pc: u64,
+    dbg_insn: u32,
+) {
+    // ===================================================================
+    // Pipeline state.
+    // ===================================================================
+
+    // F
+    let fst: FSt reset FSt::Run;
+    let fpc: u64 reset RESET_PC;     // the next instruction to hand to D
+    let s0_data: u64;                // two fetched words, at virtual s*_tag << 3
+    let s0_tag: u61;
+    let s0_ok: u1;
+    let s1_data: u64;
+    let s1_tag: u61;
+    let s1_ok: u1;
+    let f_va: u64;                   // the word being translated or read
+    let f_pa: u64;
+    let f_drop: u1;                  // the word in flight is not wanted any more
+    let f_nopf: u1;                  // don't prefetch the word at f_nopf_tag: it faults
+    let f_nopf_tag: u61;
+    let f_stop: u1;                  // a fetch fault went down; wait for a redirect
+    let f_fault: u1;                 // a fetch fault to hand to D
+    let f_fcause: u5;
+    let f_ftval: u64;
+
+    // D
+    let d_valid: u1;
+    let d_pc: u64;
+    let d_insn: u32;                 // expanded
+    let d_c: u1;                     // compressed (16 bits)
+    let d_raw16: u16;
+    let d_fault: u1;                 // a fetch fault, not an instruction
+    let d_fcause: u5;
+    let d_ftval: u64;
+
+    // X
+    let x_valid: u1;
+    let x_pc: u64;
+    let x_insn: u32;
+    let x_c: u1;
+    let x_raw16: u16;
+    let x_u: Uop;
+    let x_a: u64;                    // integer rs1, rs2
+    let x_b: u64;
+    let x_fa: u64;                   // FP rs1, rs2, rs3
+    let x_fb: u64;
+    let x_fc: u64;
+    let x_exc: u1;
+    let x_cause: u5;
+    let x_tval: u64;
+    let x_started: u1;               // its MUL/DIV or FP operation started
+    let x_uready: u1;                // ... and finished:
+    let x_ures: u64;
+    let x_uflags: u5;
+
+    // M
+    let mst: MSt reset MSt::Run;
+    let m_valid: u1;
+    let m_pc: u64;
+    let m_npc: u64;                  // the next instruction's pc
+    let m_insn: u32;
+    let m_c: u1;
+    let m_raw16: u16;
+    let m_u: Uop;
+    let m_wint: u1;                  // it writes an integer register, an FP register
+    let m_wfp: u1;
+    let m_late: u1;                  // its result comes from M (loads, AMOs, CSRs)
+    let m_res: u64;                  // the result computed in X
+    let m_ea: u64;                   // data address (virtual)
+    let m_sdata: u64;                // store data, AMO operand, or CSR source
+    let m_exc: u1;
+    let m_cause: u5;
+    let m_tval: u64;
+    let m_fflags: u5;
+    let m_pa: u64;
+    let amo_old: u64;
+    let resv: u1;                    // LR/SC reservation
+    let resv_addr: u64;
+    let tr_cause: u64;               // the trap being taken
+    let tr_tval: u64;
+    let tr_epc: u64;
+
+    // W, and the write before it
+    let w_valid: u1;
+    let w_fp: u1;
+    let w_rd: u5;
+    let w_val: u64;
+    let wd_valid: u1;
+    let wd_fp: u1;
+    let wd_rd: u5;
+    let wd_val: u64;
+
+    // Control between stages, set below.
+    let kill_fdx: u1;                // M flushes F, D and X
+    let m_redir: u1;                 // M redirects fetch
+    let m_rpc: u64;
+    let x_redir: u1;                 // X redirects fetch (and drops D)
+    let x_rpc: u64;
+    let d_redir: u1;                 // D redirects fetch (JAL)
+    let d_rpc: u64;
+    let m_accept: u1;                // M takes an instruction from X this cycle
+    let flush_tlb: u1;
+    let flush_fbuf: u1;
+
+    // ===================================================================
+    // CSRs.
+    // ===================================================================
+    let csr: Csr;
+    let priv = csr.priv;
+    let fs_off = csr.fs == 0;
+    // Data accesses use MPP's privilege when MPRV is set in M mode.
+    let dpriv = if csr.mprv & (priv == 3) { csr.mpp } else { priv };
+
+    // ===================================================================
+    // Translation: one TLB lookup port and the walker, for M (first) and F.
+    // ===================================================================
+    let walk_m: u1;                  // the walk in progress is M's
+    let m_treq: u1;
+    let f_treq: u1;
+    let f_wva: u64;
+    let m_is_load: u1;
+    let ptw_busy: u1;
+    // M has the port whenever it holds a memory access in Run (decided from
+    // registers alone, since the lookup is on the longest paths).
+    let m_tsel: u1;
+    let sel_m = if ptw_busy { walk_m } else { m_tsel };
+    let ptw: Ptw;
+    ptw.req = if sel_m { m_treq } else { f_treq };
+    ptw.va = if sel_m { m_ea } else { f_wva };
+    ptw.kind = if sel_m { if m_is_load { 1 } else { 2 } } else { 0 };
+    ptw.priv = if sel_m { dpriv } else { priv };
+    ptw.sum = csr.sum;
+    ptw.mxr = csr.mxr;
+    ptw.satp = csr.satp;
+    ptw.flush = flush_tlb;
+    ptw_busy = ptw.busy;
+    if !ptw.busy & ptw.req & !ptw.hit {
+        walk_m <= sel_m;
+    }
+    let m_tgnt = sel_m & !ptw.busy;
+    let f_tgnt = !sel_m & !ptw.busy;
+
+    // ===================================================================
+    // The memory port: the walker, then M, then F; a request keeps the port until
+    // it is acknowledged.
+    // ===================================================================
+    let bus_lock: u2;
+    let m_breq: u1;
+    let m_bwe: u1;
+    let m_bdata: u64;
+    let f_breq: u1;
+    let owner = if bus_lock != 0 { bus_lock } else if ptw.mem_req { 1u2 } else if m_breq { 2u2 }
+        else if f_breq { 3u2 } else { 0u2 };
+    let m_lane = m_ea[0..3];
+    let m_shift = cat(m_lane, 0u3);
+    let m_size = m_u.f3[0..2];
+    let m_bytes = match m_size {
+        0 => 0x01u8,
+        1 => 0x03u8,
+        2 => 0x0fu8,
+        _ => 0xffu8,
+    };
+    mem_req = owner != 0;
+    mem_addr = match owner {
+        1 => ptw.mem_addr,
+        2 => cat(m_pa[3..64], 0u3),
+        _ => cat(f_pa[3..64], 0u3),
+    };
+    mem_we = (owner == 2) & m_bwe;
+    mem_wdata = m_bdata << m_shift;
+    mem_be = if owner == 2 { m_bytes << m_lane } else { 0xff };
+    bus_lock <= if mem_req & !mem_ack { owner } else { 0 };
+    ptw.mem_ack = mem_ack & (owner == 1);
+    ptw.mem_err = mem_err;
+    ptw.mem_rdata = mem_rdata;
+    let m_ack = mem_ack & (owner == 2);
+    let f_ack = mem_ack & (owner == 3);
+
+    // ===================================================================
+    // F: fetch. Two words are kept: the one at fpc, and the next, fetched ahead (or
+    // needed for the upper half of an instruction that crosses into it).
+    // ===================================================================
+    let w0 = fpc[3..64];
+    let w1 = w0 + 1;
+    let s0_w0 = s0_ok & (s0_tag == w0);
+    let s1_w0 = s1_ok & (s1_tag == w0);
+    let s0_w1 = s0_ok & (s0_tag == w1);
+    let s1_w1 = s1_ok & (s1_tag == w1);
+    let has0 = s0_w0 | s1_w0;
+    let has1 = s0_w1 | s1_w1;
+    let word0 = if s0_w0 { s0_data } else { s1_data };
+    let word1 = if s0_w1 { s0_data } else { s1_data };
+    let fb_word = word0 >> cat(fpc[1..3], 0u4);
+    let f_c = fb_word[0..2] != 3;
+    let f_straddle = !f_c & (fpc[1..3] == 3);
+    let f_raw = if f_c { fb_word[0..16] as u32 } else if f_straddle { cat(word1[0..16], fb_word[0..16]) }
+        else { fb_word[0..32] };
+    let f_insn = if f_c { Rvc(f_raw[0..16]).insn } else { f_raw };
+    // An instruction (or a fault) to hand to D.
+    let f_have = !f_stop & (f_fault | (has0 & (!f_straddle | has1)));
+    let d_accept: u1;
+    let f_go = f_have & d_accept;
+    let f_ilen = if f_c { 2u64 } else { 4u64 };
+
+    // The word to fetch: the one at fpc, else the next (unless it is known to
+    // fault and isn't needed yet).
+    let need1 = has0 & f_straddle;
+    let want0 = !has0;
+    let want1 = has0 & !has1 & (need1 | !(f_nopf & (f_nopf_tag == w1)));
+    let f_tw = if want0 { w0 } else { w1 };
+    f_wva = cat(f_tw, 0u3);
+    f_treq = (fst == FSt::Run) & !f_stop & !f_fault & (want0 | want1);
+    f_breq = fst == FSt::Mem;
+    // Instructions come from RAM (from 0x8000_0000) or the boot ROM (0x1000..0x1fff).
+    let f_pa_ok = (ptw.hit_pa[31..64] != 0) | (ptw.hit_pa[12..64] == 1);
+    let f_walk_pa_ok = (ptw.pa[31..64] != 0) | (ptw.pa[12..64] == 1);
+    // When a fetch fails, it is a fault only if F needs that word now.
+    let f_cur = if fst == FSt::Run { f_tw } else { f_va[3..64] };
+    let f_isw0 = f_cur == w0;
+    let f_real = f_isw0 | ((f_cur == w1) & need1);
+    let f_tv = if f_isw0 { fpc } else { cat(w1, 0u3) };
+    let f_fail: u1;
+    let f_fail_cause: u5;
+    f_fail = 0;
+    f_fail_cause = 1;
+    // A fetched word replaces the one F has moved past.
+    let victim = if s0_w0 { 1u1 } else if s1_w0 { 0u1 } else if s0_w1 { 1u1 } else { 0u1 };
+
+    if f_go {
+        fpc <= fpc + f_ilen;
+        if f_fault {
+            f_fault <= 0;
+            f_stop <= 1;
+        }
+    }
+    match fst {
+        FSt::Run => if f_treq & f_tgnt {
+            f_va <= f_wva;
+            if ptw.hit {
+                if ptw.hit_pf | !f_pa_ok {
+                    f_fail = 1;
+                    f_fail_cause = if ptw.hit_pf { 12 } else { 1 };
+                } else {
+                    f_pa <= ptw.hit_pa;
+                    fst <= FSt::Mem;
+                }
+            } else {
+                fst <= FSt::Walk;
+            }
+        },
+        FSt::Walk => if ptw.done {
+            fst <= FSt::Run;
+            f_drop <= 0;
+            if !f_drop & (ptw.pf | ptw.af | !f_walk_pa_ok) {
+                f_fail = 1;
+                f_fail_cause = if ptw.pf { 12 } else { 1 };
+            }
+        },
+        FSt::Mem => if f_ack {
+            fst <= FSt::Run;
+            f_drop <= 0;
+            if !f_drop {
+                if mem_err {
+                    f_fail = 1;
+                } else if victim {
+                    s1_data <= mem_rdata;
+                    s1_tag <= f_va[3..64];
+                    s1_ok <= 1;
+                } else {
+                    s0_data <= mem_rdata;
+                    s0_tag <= f_va[3..64];
+                    s0_ok <= 1;
+                }
+            }
+        },
+    }
+    if f_fail {
+        if f_real {
+            f_fault <= 1;
+            f_fcause <= f_fail_cause;
+            f_ftval <= f_tv;
+        } else {
+            f_nopf <= 1;
+            f_nopf_tag <= f_cur;
+        }
+    }
+
+    // Redirects: M, then X, then D. The fetched words stay unless M changes what
+    // they'd translate to (privilege, satp, a fence).
+    let redir = m_redir | x_redir | d_redir;
+    let redir_pc = if m_redir { m_rpc } else if x_redir { x_rpc } else { d_rpc };
+    if redir {
+        fpc <= redir_pc;
+        f_stop <= 0;
+        f_fault <= 0;
+    }
+    if flush_fbuf | m_redir {
+        s0_ok <= 0;
+        s1_ok <= 0;
+        f_nopf <= 0;
+        f_fault <= 0;
+        if (fst != FSt::Run) | (f_treq & f_tgnt) {
+            f_drop <= 1;
+        }
+    }
+
+    // ===================================================================
+    // Register files. Reads start in F for the instruction going to D, or are
+    // repeated for the one D holds; the values arrive in D.
+    // ===================================================================
+    let wr_int = w_valid & !w_fp & (w_rd != 0);
+    let wr_fp = w_valid & w_fp;
+    let ra = if f_go & !f_fault { f_insn } else { d_insn };
+    let rf1 = Mem::<W = 64, D = 32>(we: wr_int, waddr: w_rd, wdata: w_val, re: 1, raddr: ra[15..20]);
+    let rf2 = Mem::<W = 64, D = 32>(we: wr_int, waddr: w_rd, wdata: w_val, re: 1, raddr: ra[20..25]);
+    let ff1 = Mem::<W = 64, D = 32>(we: wr_fp, waddr: w_rd, wdata: w_val, re: 1, raddr: ra[15..20]);
+    let ff2 = Mem::<W = 64, D = 32>(we: wr_fp, waddr: w_rd, wdata: w_val, re: 1, raddr: ra[20..25]);
+    let ff3 = Mem::<W = 64, D = 32>(we: wr_fp, waddr: w_rd, wdata: w_val, re: 1, raddr: ra[27..32]);
+
+    // ===================================================================
+    // D: decode.
+    // ===================================================================
+    let du = Decode(d_insn).u;
+    let d_rs3 = d_insn[27..32];
+    // Register values: the read, or a write since it was read (W, then the one before).
+    let wd_int = wd_valid & !wd_fp & (wd_rd != 0);
+    let wd_fpw = wd_valid & wd_fp;
+    let d_a = if du.rs1 == 0 { 0 } else if wr_int & (w_rd == du.rs1) { w_val } else if wd_int & (wd_rd == du.rs1) { wd_val } else { rf1.rdata };
+    let d_b = if du.rs2 == 0 { 0 } else if wr_int & (w_rd == du.rs2) { w_val } else if wd_int & (wd_rd == du.rs2) { wd_val } else { rf2.rdata };
+    let d_fa = if wr_fp & (w_rd == du.rs1) { w_val } else if wd_fpw & (wd_rd == du.rs1) { wd_val } else { ff1.rdata };
+    let d_fb = if wr_fp & (w_rd == du.rs2) { w_val } else if wd_fpw & (wd_rd == du.rs2) { wd_val } else { ff2.rdata };
+    let d_fc = if wr_fp & (w_rd == d_rs3) { w_val } else if wd_fpw & (wd_rd == d_rs3) { wd_val } else { ff3.rdata };
+
+    // Load-use: X's result is not ready before M (loads, AMOs, CSR reads).
+    let fpu: Fpu;
+    let x_late = (x_u.cls == Cls::Load) | (x_u.cls == Cls::FpLoad) | (x_u.cls == Cls::Amo) | (x_u.cls == Cls::Csr);
+    let x_wfp = (x_u.cls == Cls::FpLoad) | ((x_u.cls == Cls::Fp) & !fpu.to_int);
+    let x_wint = !x_wfp & (x_u.cls != Cls::Store) & (x_u.cls != Cls::FpStore) & (x_u.cls != Cls::Branch);
+    let d_hazard = x_valid & x_late & (
+        (x_wint & (x_u.rd != 0) & ((x_u.rd == du.rs1) | (x_u.rd == du.rs2)))
+        | (x_wfp & ((x_u.rd == du.rs1) | (x_u.rd == du.rs2) | (x_u.rd == d_rs3)))
+    );
+    let d_is_fp = (du.cls == Cls::Fp) | (du.cls == Cls::FpLoad) | (du.cls == Cls::FpStore);
+    let d_illegal = (du.cls == Cls::Illegal) | (d_is_fp & fs_off);
+    let x_accept: u1;
+    let d_go = d_valid & !d_hazard & x_accept;
+    d_accept = !d_valid | d_go;
+    // JAL: redirect now.
+    d_redir = d_go & !d_fault & (du.cls == Cls::Jal);
+    d_rpc = d_pc + du.imm;
+
+    if d_go {
+        d_valid <= 0;
+    }
+    if f_go {
+        d_valid <= 1;
+        d_pc <= fpc;
+        d_insn <= f_insn;
+        d_c <= f_c;
+        d_raw16 <= f_raw[0..16];
+        d_fault <= f_fault;
+        d_fcause <= f_fcause;
+        d_ftval <= f_ftval;
+    }
+
+    // ===================================================================
+    // X: execute.
+    // ===================================================================
+    // Operands, forwarded from M (results computed in X) and W.
+    let m_fwd_int = m_valid & !m_exc & m_wint & (m_u.rd != 0);
+    let m_fwd_fp = m_valid & !m_exc & m_wfp;
+    let x_rs3 = x_insn[27..32];
+    let xa = if x_u.rs1 == 0 { 0 } else if m_fwd_int & (m_u.rd == x_u.rs1) { m_res } else if wr_int & (w_rd == x_u.rs1) { w_val } else { x_a };
+    let xb = if x_u.rs2 == 0 { 0 } else if m_fwd_int & (m_u.rd == x_u.rs2) { m_res } else if wr_int & (w_rd == x_u.rs2) { w_val } else { x_b };
+    let xfa = if m_fwd_fp & (m_u.rd == x_u.rs1) { m_res } else if wr_fp & (w_rd == x_u.rs1) { w_val } else { x_fa };
+    let xfb = if m_fwd_fp & (m_u.rd == x_u.rs2) { m_res } else if wr_fp & (w_rd == x_u.rs2) { w_val } else { x_fb };
+    let xfc = if m_fwd_fp & (m_u.rd == x_rs3) { m_res } else if wr_fp & (w_rd == x_rs3) { w_val } else { x_fc };
+    // A late result in M that X needs: wait for it to reach W.
+    let x_raw = m_valid & m_late & (
+        (m_wint & (m_u.rd != 0) & ((m_u.rd == x_u.rs1) | (m_u.rd == x_u.rs2)))
+        | (m_wfp & ((m_u.rd == x_u.rs1) | (m_u.rd == x_u.rs2) | (m_u.rd == x_rs3)))
+    );
+
+    let alu_a = if x_u.zero_a { 0 } else if x_u.pc_a { x_pc } else { xa };
+    let alu_b = if x_u.use_imm { x_u.imm } else { xb };
+    let alu = Alu(x_u.alu, x_u.word, alu_a, alu_b);
+    let taken = BranchCmp(x_u.f3, alu.eq, alu.lt, alu.ltu).taken;
+    let x_npc = x_pc + (if x_c { 2u64 } else { 4u64 });
+    let x_is_mem = (x_u.cls == Cls::Load) | (x_u.cls == Cls::Store) | (x_u.cls == Cls::Amo)
+        | (x_u.cls == Cls::FpLoad) | (x_u.cls == Cls::FpStore);
+    let x_size = x_u.f3[0..2];
+    let x_misaligned = match x_size {
+        0 => 0,
+        1 => alu.y[0],
+        2 => alu.y[0..2] != 0,
+        _ => alu.y[0..3] != 0,
+    };
+    let x_is_load = (x_u.cls == Cls::Load) | (x_u.cls == Cls::FpLoad)
+        | ((x_u.cls == Cls::Amo) & (x_insn[27..32] == 2));
+    let x_bits = if x_c { x_raw16 as u64 } else { x_insn as u64 };
+
+    // Multi-cycle units.
+    let mul_p: u64;
+    let md: MulDiv;
+    md.f3 = x_u.f3;
+    md.word = x_u.word;
+    md.a = xa;
+    md.b = xb;
+    md.mul_p = mul_p;
+    fpu.insn = x_insn;
+    fpu.frm = csr.frm;
+    fpu.a = xfa;
+    fpu.b = xfb;
+    fpu.c = xfc;
+    fpu.x = xa;
+    fpu.mul_p = mul_p;
+    let x_fp_ill = (x_u.cls == Cls::Fp) & fpu.illegal;
+    let x_unit = !x_exc & !x_fp_ill & ((x_u.cls == Cls::MulDiv) | (x_u.cls == Cls::Fp));
+    let x_can_start = x_valid & x_unit & !x_started & !x_raw;
+    md.start = x_can_start & (x_u.cls == Cls::MulDiv);
+    fpu.start = x_can_start & (x_u.cls == Cls::Fp);
+    let x_kill = kill_fdx & x_valid & x_started & !x_uready;
+    md.kill = x_kill;
+    fpu.kill = x_kill;
+    // One 32x32 multiplier, for MulDiv and the FPU, with its product registered.
+    let mul_x = if x_u.cls == Cls::Fp { fpu.mul_a } else { md.mul_a };
+    let mul_y = if x_u.cls == Cls::Fp { fpu.mul_b } else { md.mul_b };
+    mul_p <= (mul_x as u64) * (mul_y as u64);
+
+    if x_can_start {
+        x_started <= 1;
+    }
+    if md.done {
+        x_uready <= 1;
+        x_ures <= md.y;
+    }
+    if fpu.done {
+        x_uready <= 1;
+        x_ures <= fpu.result;
+        x_uflags <= fpu.flags;
+    }
+
+    let x_done = x_valid & !x_raw & (!x_unit | x_uready);
+    let x_go = x_done & m_accept;
+    x_accept = !x_valid | x_go;
+    let x_exc_now = x_exc | x_fp_ill | (x_is_mem & x_misaligned);
+    // Taken branches and JALR change the path.
+    x_redir = x_go & !x_exc & (((x_u.cls == Cls::Branch) & taken) | (x_u.cls == Cls::Jalr));
+    x_rpc = if x_u.cls == Cls::Jalr { cat(alu.y[1..64], 0u1) } else { x_pc + x_u.imm };
+
+    // Operands keep up with the writes ahead while X waits.
+    x_a <= xa;
+    x_b <= xb;
+    x_fa <= xfa;
+    x_fb <= xfb;
+    x_fc <= xfc;
+    if x_go {
+        x_valid <= 0;
+    }
+    if d_go {
+        x_valid <= 1;
+        x_pc <= d_pc;
+        x_insn <= d_insn;
+        x_c <= d_c;
+        x_raw16 <= d_raw16;
+        x_u <= du;
+        x_a <= d_a;
+        x_b <= d_b;
+        x_fa <= d_fa;
+        x_fb <= d_fb;
+        x_fc <= d_fc;
+        x_exc <= d_fault | d_illegal;
+        x_cause <= if d_fault { d_fcause } else { 2 };
+        x_tval <= if d_fault { d_ftval } else if d_c { d_raw16 as u64 } else { d_insn as u64 };
+        x_started <= 0;
+        x_uready <= 0;
+    }
+
+    // ===================================================================
+    // M: memory and commit.
+    // ===================================================================
+    let m_f5 = m_insn[27..32];
+    let m_is_amo = m_u.cls == Cls::Amo;
+    let m_is_lr = m_is_amo & (m_f5 == 2);
+    let m_is_sc = m_is_amo & (m_f5 == 3);
+    m_is_load = (m_u.cls == Cls::Load) | (m_u.cls == Cls::FpLoad) | m_is_lr;
+    let m_is_mem = (m_u.cls == Cls::Load) | (m_u.cls == Cls::Store) | m_is_amo
+        | (m_u.cls == Cls::FpLoad) | (m_u.cls == Cls::FpStore);
+    let m_bits = if m_c { m_raw16 as u64 } else { m_insn as u64 };
+    let sc_fail = m_is_sc & !(resv & (resv_addr == m_ea));
+    let m_first = (mst == MSt::Run) & m_valid;
+    m_tsel = m_first & m_is_mem;
+    m_treq = m_tsel & !csr.irq & !m_exc & !sc_fail;
+
+    // Loads.
+    let raw = mem_rdata >> m_shift;
+    let loaded = match m_u.f3 {
+        0 => cat(rep(raw[7], 56), raw[0..8]),
+        1 => cat(rep(raw[15], 48), raw[0..16]),
+        2 => Sext32(raw[0..32]).y,
+        4 => raw[0..8] as u64,
+        5 => raw[0..16] as u64,
+        6 => raw[0..32] as u64,
+        _ => raw,
+    };
+    let fp_loaded = if m_u.f3 == 2 { cat(0xffff_ffffu32, raw[0..32]) } else { raw };
+    // AMO arithmetic (32-bit AMOs on sign-extended words).
+    let amo_b = if m_size == 2 { Sext32(m_sdata[0..32]).y } else { m_sdata };
+    let amo_lt = (amo_old ^ SIGN) < (amo_b ^ SIGN);
+    let amo_ltu = amo_old < amo_b;
+    let amo_val = match m_f5 {
+        0 => amo_old + amo_b,
+        1 => amo_b,
+        4 => amo_old ^ amo_b,
+        8 => amo_old | amo_b,
+        12 => amo_old & amo_b,
+        16 => if amo_lt { amo_old } else { amo_b },
+        20 => if amo_lt { amo_b } else { amo_old },
+        24 => if amo_ltu { amo_old } else { amo_b },
+        _ => if amo_ltu { amo_b } else { amo_old },
+    };
+    let m_data_we = !m_is_load & !(m_is_amo & !m_is_sc);
+
+    // CSR instructions: checked and read in Run, written in Csr.
+    csr.addr = m_insn[20..32];
+    csr.op = m_u.f3[0..2];
+    csr.src = m_sdata;
+    csr.wr = (m_u.f3[0..2] == 1) | (m_u.rs1 != 0);
+    csr.mtip = mtip;
+    csr.msip = msip;
+    csr.meip = meip;
+    csr.seip = seip;
+    csr.mtime = mtime;
+    csr.trap = mst == MSt::Trap;
+    csr.cause = tr_cause;
+    csr.tval = tr_tval;
+    csr.epc = tr_epc;
+    csr.exec = 0;
+    csr.mret = 0;
+    csr.sret = 0;
+
+    // Retirement and FP flags reach the CSRs a cycle after a commit; a CSR
+    // instruction right behind waits for them.
+    let retire_d: u1;
+    let fp_done_d: u1;
+    let fp_flags_d: u5;
+
+    // What M does this cycle.
+    let m_done: u1;                  // the instruction commits
+    let m_wb: u1;                    // ... writing a register:
+    let m_wb_fp: u1;
+    let m_wb_val: u64;
+    let trap: u1;                    // the instruction (or an interrupt) traps
+    let cause: u64;
+    let tval: u64;
+    m_done = 0;
+    m_wb = 0;
+    m_wb_fp = 0;
+    m_wb_val = m_res;
+    trap = 0;
+    cause = 0;
+    tval = 0;
+    m_breq = 0;
+    m_bwe = 0;
+    m_bdata = m_sdata;
+    m_redir = 0;
+    m_rpc = m_npc;
+    kill_fdx = 0;
+    flush_tlb = 0;
+    flush_fbuf = 0;
+
+    match mst {
+        MSt::Run => if m_valid {
+            if csr.irq {
+                trap = 1;
+                cause = csr.irq_cause;
+            } else if m_exc {
+                trap = 1;
+                cause = m_cause as u64;
+                tval = m_tval;
+            } else {
+                match m_u.cls {
+                    Cls::Load | Cls::Store | Cls::Amo | Cls::FpLoad | Cls::FpStore => if sc_fail {
+                        // SC without a matching reservation fails without accessing memory.
+                        m_done = 1;
+                        m_wb = 1;
+                        m_wb_val = 1;
+                        resv <= 0;
+                    } else if m_tgnt {
+                        if ptw.hit {
+                            if ptw.hit_pf {
+                                trap = 1;
+                                cause = if m_is_load { 13 } else { 15 };
+                                tval = m_ea;
+                            } else {
+                                m_pa <= ptw.hit_pa;
+                                mst <= MSt::Mem;
+                            }
+                        } else {
+                            mst <= MSt::Walk;
+                        }
+                    },
+                    Cls::Csr => if retire_d {
+                        // (wait)
+                    } else if csr.illegal {
+                        trap = 1;
+                        cause = 2;
+                        tval = m_bits;
+                    } else {
+                        mst <= MSt::Csr;
+                    },
+                    Cls::Ecall => {
+                        trap = 1;
+                        cause = 8 + (priv as u64);
+                    }
+                    Cls::Ebreak => {
+                        trap = 1;
+                        cause = 3;
+                        tval = m_pc;
+                    }
+                    Cls::Mret => if priv == 3 {
+                        csr.mret = 1;
+                        m_done = 1;
+                        m_redir = 1;
+                        m_rpc = csr.ret_pc;
+                        resv <= 0;
+                    } else {
+                        trap = 1;
+                        cause = 2;
+                        tval = m_bits;
+                    },
+                    Cls::Sret => if (priv == 3) | ((priv == 1) & !csr.tsr) {
+                        csr.sret = 1;
+                        m_done = 1;
+                        m_redir = 1;
+                        m_rpc = csr.ret_pc;
+                        resv <= 0;
+                    } else {
+                        trap = 1;
+                        cause = 2;
+                        tval = m_bits;
+                    },
+                    Cls::Wfi => if (priv == 0) | ((priv == 1) & csr.tw) {
+                        trap = 1;
+                        cause = 2;
+                        tval = m_bits;
+                    } else {
+                        mst <= MSt::Wfi;
+                    },
+                    Cls::Sfence => if (priv == 0) | ((priv == 1) & csr.tvm) {
+                        trap = 1;
+                        cause = 2;
+                        tval = m_bits;
+                    } else {
+                        m_done = 1;
+                        flush_tlb = 1;
+                        flush_fbuf = 1;
+                        m_redir = 1;
+                    },
+                    // FENCE.I (and FENCE): refetch what follows.
+                    Cls::Fence => {
+                        m_done = 1;
+                        flush_fbuf = 1;
+                        m_redir = 1;
+                    }
+                    _ => {
+                        m_done = 1;
+                        m_wb = m_wint | m_wfp;
+                        m_wb_fp = m_wfp;
+                    }
+                }
+            }
+        },
+        MSt::Walk => if ptw.done {
+            if ptw.pf | ptw.af {
+                trap = 1;
+                cause = if m_is_load { if ptw.pf { 13 } else { 5 } } else { if ptw.pf { 15 } else { 7 } };
+                tval = m_ea;
+            } else {
+                m_pa <= ptw.pa;
+                mst <= MSt::Mem;
+            }
+        },
+        MSt::Mem => {
+            m_breq = 1;
+            m_bwe = m_data_we;
+            if m_ack {
+                if mem_err {
+                    trap = 1;
+                    cause = if m_is_load { 5 } else { 7 };
+                    tval = m_ea;
+                } else if m_is_amo & !m_is_lr & !m_is_sc {
+                    amo_old <= loaded;
+                    mst <= MSt::AmoW;
+                } else {
+                    m_done = 1;
+                    mst <= MSt::Run;
+                    m_wb = m_is_load | m_is_sc;
+                    m_wb_fp = m_u.cls == Cls::FpLoad;
+                    m_wb_val = if m_is_sc { 0 } else if m_u.cls == Cls::FpLoad { fp_loaded } else { loaded };
+                    if m_is_lr {
+                        resv <= 1;
+                        resv_addr <= m_ea;
+                    }
+                    if m_is_sc {
+                        resv <= 0;
+                    }
+                }
+            }
+        }
+        MSt::AmoW => {
+            m_breq = 1;
+            m_bwe = 1;
+            m_bdata = amo_val;
+            if m_ack {
+                if mem_err {
+                    trap = 1;
+                    cause = 7;
+                    tval = m_ea;
+                } else {
+                    m_done = 1;
+                    mst <= MSt::Run;
+                    m_wb = 1;
+                    m_wb_val = amo_old;
+                }
+            }
+        }
+        MSt::Csr => {
+            csr.exec = 1;
+            m_done = 1;
+            mst <= MSt::Run;
+            m_wb = 1;
+            m_wb_val = csr.rdata;
+            // The write may change what younger instructions see: refetch them.
+            m_redir = 1;
+            flush_fbuf = 1;
+            flush_tlb = csr.wr & (csr.addr == 0x180);
+        }
+        MSt::Wfi => if csr.wake {
+            m_done = 1;
+            mst <= MSt::Run;
+        },
+        MSt::Trap => {
+            m_redir = 1;
+            m_rpc = csr.trap_pc;
+            mst <= MSt::Run;
+        }
+    }
+
+    if trap {
+        // Taken in the Trap cycle that follows, which flushes everything younger
+        // (including what moved into M meanwhile).
+        tr_cause <= cause;
+        tr_tval <= tval;
+        tr_epc <= m_pc;
+        resv <= 0;
+        mst <= MSt::Trap;
+    }
+    kill_fdx = m_redir;
+
+    // M is free for the next instruction once this one leaves. That is decided
+    // from M's state alone (not from translation or traps, which would make a long
+    // path back through X, D and F): when M traps or redirects instead, whatever
+    // moved in is flushed below.
+    let m_leaves = m_done | trap;
+    let m_simple = (m_u.cls == Cls::Alu) | (m_u.cls == Cls::Jal) | (m_u.cls == Cls::Jalr)
+        | (m_u.cls == Cls::Branch) | (m_u.cls == Cls::MulDiv) | (m_u.cls == Cls::Fp);
+    m_accept = !m_valid | ((mst == MSt::Run) & m_simple)
+        | ((mst == MSt::Mem) & m_ack & !(m_is_amo & !m_is_lr & !m_is_sc))
+        | ((mst == MSt::AmoW) & m_ack) | ((mst == MSt::Wfi) & csr.wake);
+    if m_leaves {
+        m_valid <= 0;
+    }
+    if x_go {
+        m_valid <= 1;
+        m_pc <= x_pc;
+        m_npc <= x_npc;
+        m_insn <= x_insn;
+        m_c <= x_c;
+        m_raw16 <= x_raw16;
+        m_u <= x_u;
+        m_wint <= x_wint;
+        m_wfp <= x_wfp;
+        m_late <= x_late;
+        m_res <= match x_u.cls {
+            Cls::Jal | Cls::Jalr => x_npc,
+            Cls::MulDiv | Cls::Fp => x_ures,
+            _ => alu.y,
+        };
+        m_ea <= alu.y;
+        m_sdata <= match x_u.cls {
+            Cls::FpStore => xfb,
+            Cls::Csr => if x_u.f3[2] { x_u.imm } else { xa },
+            _ => xb,
+        };
+        m_exc <= x_exc_now;
+        m_cause <= if x_exc { x_cause } else if x_fp_ill { 2 } else if x_is_load { 4 } else { 6 };
+        m_tval <= if x_exc { x_tval } else if x_fp_ill { x_bits } else { alu.y };
+        m_fflags <= x_uflags;
+    }
+
+    // Flushes, after everything above: M, then X, then D.
+    if kill_fdx {
+        d_valid <= 0;
+        x_valid <= 0;
+        m_valid <= 0;
+    } else if x_redir {
+        // What D held (and may be handing to X) is on the wrong path.
+        d_valid <= 0;
+        x_valid <= 0;
+    } else if d_redir {
+        // D's JAL has moved to X; what F fetched after it is not wanted.
+        d_valid <= 0;
+    }
+
+    // ===================================================================
+    // W: writeback.
+    // ===================================================================
+    w_valid <= m_done & m_wb;
+    w_fp <= m_wb_fp;
+    w_rd <= m_u.rd;
+    w_val <= m_wb_val;
+    wd_valid <= w_valid;
+    wd_fp <= w_fp;
+    wd_rd <= w_rd;
+    wd_val <= w_val;
+
+    // Retirement and FP state reach the CSRs a cycle later.
+    retire_d <= m_done;
+    fp_done_d <= m_done & ((m_u.cls == Cls::Fp) | (m_u.cls == Cls::FpLoad));
+    fp_flags_d <= if m_u.cls == Cls::Fp { m_fflags } else { 0 };
+    csr.retire = retire_d;
+    csr.fp_done = fp_done_d;
+    csr.fp_flags = fp_flags_d;
+    csr.fp_dirty = 1;
+
+    dbg_retire = m_done;
+    dbg_trap = trap;
+    dbg_pc = m_pc;
+    dbg_insn = m_insn;
+}

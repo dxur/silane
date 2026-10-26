@@ -1,0 +1,12 @@
+[package]
+name = "si-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "End-to-end tests: .si sources compiled to Rust by a build script and simulated"
+
+[dependencies]
+silane = { version = "0.1.0", path = "../silane" }
+
+[build-dependencies]
+silane-lang = { version = "0.1.0", path = "../silane-lang" }

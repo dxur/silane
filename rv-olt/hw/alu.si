@@ -1,0 +1,52 @@
+// Integer ALU and branch comparator. There are no signed types: signed comparisons
+// flip the sign bits, and arithmetic shifts fill with the sign by hand.
+
+import "defs.si";
+
+const SIGN: u64 = 0x8000_0000_0000_0000;
+
+// Sign-extends a 32-bit value.
+module Sext32(x: u32) -> (y: u64) {
+    y = cat(rep(x[31], 32), x);
+}
+
+// One shifter serves all three shifts: SLL shifts the bit-reversed operand right
+// and reverses the result. `eq`, `lt` and `ltu` compare a and b for branches and AMOs.
+module Alu(op: AluOp, word: u1, a: u64, b: u64) -> (y: u64, eq: u1, lt: u1, ltu: u1) {
+    eq = a == b;
+    lt = (a ^ SIGN) < (b ^ SIGN);
+    ltu = a < b;
+
+    // 32-bit ops shift by 5 bits; SRLW/SRAW shift the low word, extended to 64 bits.
+    let sh = if word { cat(0u1, b[0..5]) } else { b[0..6] };
+    let left = op == AluOp::Sll;
+    let arith = op == AluOp::Sra;
+    let sh_in = if left { a.rev() } else if word { if arith { Sext32(a[0..32]).y } else { a[0..32] as u64 } } else { a };
+    let fill = if arith & sh_in[63] { !(0xffff_ffff_ffff_ffff_u64 >> sh) } else { 0 };
+    let shifted = (sh_in >> sh) | fill;
+
+    let r = match op {
+        AluOp::Add => a + b,
+        AluOp::Sub => a - b,
+        AluOp::Sll => shifted.rev(),
+        AluOp::Slt => lt as u64,
+        AluOp::Sltu => ltu as u64,
+        AluOp::Xor => a ^ b,
+        AluOp::Srl | AluOp::Sra => shifted,
+        AluOp::Or => a | b,
+        AluOp::And => a & b,
+    };
+    y = if word { Sext32(r[0..32]).y } else { r };
+}
+
+// Branch condition for funct3 (BEQ, BNE, -, -, BLT, BGE, BLTU, BGEU), from the ALU's
+// comparison of rs1 and rs2.
+module BranchCmp(f3: u3, eq: u1, lt: u1, ltu: u1) -> (taken: u1) {
+    let c = match f3[1..3] {
+        0 => eq,
+        2 => lt,
+        3 => ltu,
+        _ => 0,
+    };
+    taken = c ^ f3[0];
+}

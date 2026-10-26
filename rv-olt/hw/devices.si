@@ -1,0 +1,245 @@
+// Memory-mapped devices of the SoC. Each sees one 64-bit word access at a time:
+// `sel` for a cycle, `off` (a multiple of 8) within the device, `be` the bytes
+// accessed. Reads answer combinationally in `rdata`; writes and read side effects
+// happen at the end of the cycle.
+
+// The bit mask of byte enables.
+module ByteMask(be: u8) -> (m: u64) {
+    m = cat(
+        rep(be[7], 8), rep(be[6], 8), rep(be[5], 8), rep(be[4], 8),
+        rep(be[3], 8), rep(be[2], 8), rep(be[1], 8), rep(be[0], 8),
+    );
+}
+
+// Core-local interruptor for one hart (the SiFive CLINT layout): msip at 0x0,
+// mtimecmp at 0x4000, mtime at 0xbff8. mtime counts `tick`s; mtip follows
+// mtime >= mtimecmp a cycle later.
+module Clint(sel: u1, off: u16, we: u1, wdata: u64, be: u8, tick: u1) -> (
+    rdata: u64,
+    mtime: u64,
+    mtip: u1,
+    msip: u1,
+) {
+    let mtimecmp: u64 reset 0xffff_ffff_ffff_ffff;
+    let m = ByteMask(be).m;
+    let merge_cmp = (mtimecmp & !m) | (wdata & m);
+    let merge_time = (mtime & !m) | (wdata & m);
+
+    rdata = match off {
+        0x0000 => msip as u64,
+        0x4000 => mtimecmp,
+        0xbff8 => mtime,
+        _ => 0,
+    };
+    mtip <= mtime >= mtimecmp;
+
+    if tick {
+        mtime <= mtime + 1;
+    }
+    if sel & we {
+        match off {
+            0x0000 => if be[0] {
+                msip <= wdata[0];
+            },
+            0x4000 => mtimecmp <= merge_cmp,
+            0xbff8 => mtime <= merge_time,
+            _ => {}
+        }
+    }
+}
+
+// Platform-level interrupt controller (sifive,plic-1.0.0): sources 1..15 (level
+// triggered), priorities 0..7, two contexts (0: hart 0 M mode, 1: hart 0 S mode).
+module Plic(sel: u1, off: u32, we: u1, wdata: u64, be: u8, src: u16) -> (
+    rdata: u64,
+    eip: [u1; 2],
+) {
+    let prio: [u3; 16];
+    let pending: u16;
+    let claimed: u16;
+    let enable: [u16; 2];
+    let threshold: [u3; 2];
+
+    // The highest-priority pending, enabled source above each threshold.
+    let t0 = PlicTarget(pending & enable[0], prio, threshold[0]);
+    let t1 = PlicTarget(pending & enable[1], prio, threshold[1]);
+    let best: [u4; 2];
+    best[0] = t0.id;
+    best[1] = t1.id;
+    eip[0] <= t0.id != 0;
+    eip[1] <= t1.id != 0;
+
+    // Context registers: enables at 0x2000 + 0x80 * c, threshold and claim at
+    // 0x200000 + 0x1000 * c (claim in the upper half of that word).
+    let ctx_en = (off[12..32] == 0x2) & (off[0..7] == 0);
+    let ctx_tc = (off[12..32] >= 0x200) & (off[0..12] == 0);
+    let c_en = off[7];
+    let c_tc = off[12];
+    let pidx = off[3..6];
+
+    rdata = 0;
+    if off < 0x40 {
+        // Priorities: two per word.
+        let lo = cat(pidx, 0u1);
+        rdata = cat(0u29, prio[lo + 1], 0u29, prio[lo]);
+    } else if off == 0x1000 {
+        rdata = pending as u64;
+    } else if ctx_en {
+        rdata = enable[c_en] as u64;
+    } else if ctx_tc {
+        rdata = cat(0u28, best[c_tc], 0u29, threshold[c_tc]);
+    }
+
+    // Gateways: a level-high source becomes pending unless it is being served.
+    pending <= (pending | src) & !claimed & 0xfffe;
+
+    if sel {
+        if we {
+            if off < 0x40 {
+                let lo = cat(pidx, 0u1);
+                if be[0] {
+                    prio[lo] <= wdata[0..3];
+                }
+                if be[4] {
+                    prio[lo + 1] <= wdata[32..35];
+                }
+            } else if ctx_en {
+                if be[0] {
+                    enable[c_en] <= wdata[0..16] & 0xfffe;
+                }
+            } else if ctx_tc {
+                if be[0] {
+                    threshold[c_tc] <= wdata[0..3];
+                }
+                // Complete: the source may be signalled again.
+                if be[4] {
+                    claimed <= claimed & !(1u16 << wdata[32..36]);
+                }
+            }
+        } else if ctx_tc & be[4] {
+            // Claim.
+            claimed <= claimed | ((1u16 << best[c_tc]) & 0xfffe);
+            pending <= (pending | src) & !claimed & !(1u16 << best[c_tc]) & 0xfffe;
+        }
+    }
+}
+
+// One PLIC context's choice: the highest-priority source in `cand` whose priority is
+// above `threshold` (the lowest id on ties), or 0. A tournament: four rounds of
+// pairwise comparisons.
+module PlicTarget(cand: u16, prio: [u3; 16], threshold: u3) -> (id: u4) {
+    // Round r has 16 >> r entrants; an entrant is (valid, priority, id).
+    let v: [[u1; 16]; 5];
+    let p: [[u3; 16]; 5];
+    let n: [[u4; 16]; 5];
+    for i in 0..16 {
+        v[0][i] = cand[i] & (prio[i] > threshold) & (i != 0);
+        p[0][i] = prio[i];
+        n[0][i] = i;
+    }
+    for r in 0..4 {
+        let m = 16 >> (r + 1);
+        for i in 0..m {
+            // The lower id (left) wins ties.
+            let left = v[r][2 * i] & (!v[r][2 * i + 1] | (p[r][2 * i] >= p[r][2 * i + 1]));
+            v[r + 1][i] = v[r][2 * i] | v[r][2 * i + 1];
+            p[r + 1][i] = if left { p[r][2 * i] } else { p[r][2 * i + 1] };
+            n[r + 1][i] = if left { n[r][2 * i] } else { n[r][2 * i + 1] };
+        }
+        for i in m..16 {
+            v[r + 1][i] = 0;
+            p[r + 1][i] = 0;
+            n[r + 1][i] = 0;
+        }
+    }
+    id = if v[4][0] { n[4][0] } else { 0 };
+}
+
+// An ns16550a-compatible UART (8-bit registers at offsets 0..7, no FIFOs: a single
+// receive holding register; transmitted bytes leave at once on `tx_*`).
+module Uart(sel: u1, we: u1, wdata: u64, be: u8, rx_valid: u1, rx_data: u8) -> (
+    rdata: u64,
+    irq: u1,
+    rx_ready: u1,
+    tx_valid: u1,
+    tx_data: u8,
+) {
+    let rbr: u8;
+    let dr: u1;          // receive data ready
+    let ier: u4;
+    let lcr: u8;
+    let mcr: u5;
+    let scr: u8;
+    let dll: u8;
+    let dlm: u8;
+    let fifo_en: u1;
+    let thre_ip: u1;     // transmitter-empty interrupt pending
+
+    let dlab = lcr[7];
+    let rx_ip = ier[0] & dr;
+    let tx_ip = ier[1] & thre_ip;
+    irq = rx_ip | tx_ip;
+    let iir = cat(rep(fifo_en, 2), 0u2, if rx_ip { 0b010u3 } else if tx_ip { 0b001u3 } else { 0b000u3 }, !irq);
+    let lsr = cat(0b0110_000u7, dr);
+
+    rdata = cat(
+        scr,
+        0b1011_0000u8,                                   // MSR: DCD, DSR, CTS
+        lsr,
+        0u3, mcr,
+        lcr,
+        iir,
+        if dlab { dlm } else { ier as u8 },
+        if dlab { dll } else { rbr },
+    );
+
+    rx_ready = !dr;
+    if rx_valid & !dr {
+        rbr <= rx_data;
+        dr <= 1;
+    }
+
+    tx_valid = 0;
+    tx_data = wdata[0..8];
+    if sel & we {
+        if be[0] {
+            if dlab {
+                dll <= wdata[0..8];
+            } else {
+                tx_valid = 1;
+                thre_ip <= 1;
+            }
+        }
+        if be[1] {
+            if dlab {
+                dlm <= wdata[8..16];
+            } else {
+                ier <= wdata[8..12];
+                // Enabling the THRE interrupt with the transmitter empty raises it.
+                if wdata[9] & !ier[1] {
+                    thre_ip <= 1;
+                }
+            }
+        }
+        if be[2] {
+            fifo_en <= wdata[16];
+        }
+        if be[3] {
+            lcr <= wdata[24..32];
+        }
+        if be[4] {
+            mcr <= wdata[32..37];
+        }
+        if be[7] {
+            scr <= wdata[56..64];
+        }
+    } else if sel {
+        if be[0] & !dlab {
+            dr <= 0;
+        }
+        // Reading IIR acknowledges a THRE interrupt it reports.
+        if be[2] & !rx_ip & tx_ip {
+            thre_ip <= 0;
+        }
+    }
+}

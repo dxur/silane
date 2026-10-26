@@ -1,0 +1,5 @@
+// Synchronization primitives from the silane library (`silane::cdc`).
+
+// Two-register synchronizer: brings an asynchronous bit (from another clock, or from
+// outside the chip) into the clock domain of the logic using `q`.
+extern module Sync2(d: u1 @src) -> (q: u1 @dst) = "::silane::cdc::Sync2";

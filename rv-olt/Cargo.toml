@@ -1,0 +1,11 @@
+[package]
+name = "rv-olt"
+version = "0.1.0"
+edition = "2024"
+description = "An RV64GC core and SoC in silane that boots Linux"
+
+[dependencies]
+silane = { path = "../crates/silane" }
+
+[build-dependencies]
+silane-lang = { path = "../crates/silane-lang" }

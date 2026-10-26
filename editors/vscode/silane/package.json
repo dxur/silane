@@ -1,0 +1,34 @@
+{
+  "name": "silane",
+  "displayName": "Silane HDL",
+  "description": "Syntax highlighting and language support for the Silane Hardware Description Language (.si)",
+  "version": "0.2.0",
+  "publisher": "silane-lang",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "silane",
+        "aliases": ["Silane", "silane"],
+        "extensions": [".si"],
+        "configuration": "./language-configuration.json",
+        "icon": {
+          "light": "./icons/si-light.svg",
+          "dark": "./icons/si-dark.svg"
+        }
+      }
+    ],
+    "grammars": [
+      {
+        "language": "silane",
+        "scopeName": "source.si",
+        "path": "./syntaxes/silane.tmLanguage.json"
+      }
+    ]
+  }
+}

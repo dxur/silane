@@ -1,0 +1,85 @@
+// VP8 boolean decoder (RFC 6386, section 7): one bool per cycle.
+//
+// Bytes stream in through `in_*`; `in_last` marks the last byte of the partition,
+// after which the decoder reads zeros, as libvpx does. `clear` drops all state so the
+// next byte starts a new partition.
+//
+// The decoder keeps up to 32 bits of the partition in `win`, most significant first:
+// the top 16 are the arithmetic decoder's value, the rest are bits read ahead. A bool
+// can be decoded once 23 bits are there (a decision shifts out at most 7), and a byte
+// is read whenever it fits, so a request each cycle never waits once primed.
+module BoolDecoder(
+    clear: u1,
+    in_valid: u1,
+    in_data: u8,
+    in_last: u1,
+    // Decode one bool this cycle, which is 0 with probability `prob / 256`.
+    req: u1,
+    prob: u8,
+) -> (
+    in_ready: u1,
+    // `bit` is valid, and a request is taken, when `ready` is high.
+    ready: u1,
+    bit: u1,
+) {
+    let win: u32;
+    let fill: u6;
+    // The range minus one (127..=254 between bools), which saves adders: with
+    // hi = ((range - 1) * prob) >> 8, the split is hi + 1.
+    let rm1: u8 reset 254;
+    let ended: u1;
+
+    ready = fill >= 23;
+
+    // Read a byte (or a zero past the end) into the free space below the valid bits.
+    let refill = (fill <= 24) & (in_valid | ended);
+    in_ready = (fill <= 24) & !ended & !clear;
+    let byte = if ended { 0 } else { in_data };
+    let base = if refill { win | ((byte as u32) << (24 - fill)) } else { win };
+
+    // The decision only needs the top byte of the value: value >= split << 8, that is
+    // top > hi. Both outcomes are normalized in parallel, so the decision only picks
+    // one at the end. A range r normalized by s gives (r << s) - 1 = ((r - 1) << s)
+    // with s ones below.
+    let top = win[24..32];
+    let hi = ((rm1 as u16) * (prob as u16))[8..16];
+    bit = top > hi;
+    // Outcome 0: range = hi + 1. Outcome 1: range = rm1 - hi.
+    let shift0 = Clz8(hi + 1).n;
+    let r1m1 = rm1 - hi - 1;
+    let shift1 = Clz8(rm1 - hi).n;
+    let win0 = base << shift0;
+    let win1 = cat(top - hi - 1, base[0..24]) << shift1;
+    let ones0 = (0xffu8 >> (8 - (shift0 as u4)))[0..8];
+    let ones1 = (0xffu8 >> (8 - (shift1 as u4)))[0..8];
+
+    let take = req & ready;
+    let used = if take { if bit { shift1 as u6 } else { shift0 as u6 } } else { 0 };
+    let loaded = if take { if bit { win1 } else { win0 } } else { base };
+
+    if clear {
+        win <= 0;
+        fill <= 0;
+        rm1 <= 254;
+        ended <= 0;
+    } else {
+        win <= loaded;
+        fill <= fill + (if refill { 8 } else { 0 }) - used;
+        if take {
+            rm1 <= if bit { (r1m1 << shift1) | ones1 } else { (hi << shift0) | ones0 };
+        }
+        if in_valid & in_ready & in_last {
+            ended <= 1;
+        }
+    }
+}
+
+// Count of leading zeros of a non-zero byte (the normalization shift of a range).
+module Clz8(x: u8) -> (n: u3) {
+    n = 0;
+    for i in 0..8 {
+        if x[i] {
+            n = 7 - i;
+        }
+    }
+}

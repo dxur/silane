@@ -1,0 +1,46 @@
+import "counter.si";
+
+// Pulse-width modulation built on a sub-module.
+module Pwm<W = 8>(duty: u<W>) -> (pwm: u1) {
+    let c = Counter::<W = W>(en: true, clear: false);
+    pwm = c.count < duty;
+}
+
+// N-stage shift register exposing every stage.
+module ShiftReg<N = 4, W = 8>(d: u<W>) -> (q: u<W>, taps: [u<W>; N]) {
+    let stages: [u<W>; N];
+    stages[0] <= d;
+    for i in 1..N {
+        stages[i] <= stages[i - 1];
+    }
+    q = stages[N - 1];
+    taps = stages;
+}
+
+// Population count, built as a chain of partial sums.
+module PopCount<W = 16>(x: u<W>) -> (ones: u<clog2(W + 1)>) {
+    let partial: [u<clog2(W + 1)>; W + 1];
+    partial[0] = 0;
+    for i in 0..W {
+        partial[i + 1] = partial[i] + (x[i] as u<clog2(W + 1)>);
+    }
+    ones = partial[W];
+}
+
+// Index of the highest set bit (0 when no bit is set).
+module PriorityEncoder(req: u8) -> (index: u3, valid: u1) {
+    index = 0;
+    for i in 0..8 {
+        if req[i] {
+            index = i;
+        }
+    }
+    valid = req.any();
+}
+
+// Byte swap, bit reversal and replication via cat and slices.
+module Swizzle(x: u16) -> (swapped: u16, reversed: u16, doubled: u32) {
+    swapped = cat(x[0..8], x[8..16]);
+    reversed = x.rev();
+    doubled = rep(x[0..8], 4);
+}

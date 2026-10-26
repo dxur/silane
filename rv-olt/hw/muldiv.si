@@ -1,0 +1,143 @@
+// M extension: an iterative multiplier (four 32x32 partial products) and a
+// restoring divider (one quotient bit per cycle).
+//
+// `start` begins an operation while idle; `done` is high for one cycle with the
+// result in `y`. Signed operands are handled by magnitude, with the signs fixed at
+// the end.
+
+import "alu.si";
+
+enum MdState { Idle, Mul, Div, Fix }
+
+// Products come from a 32x32 multiplier outside: `mul_p` is `mul_a * mul_b` of the
+// previous cycle.
+// `kill` abandons an operation in progress.
+module MulDiv(start: u1, kill: u1, f3: u3, word: u1, a: u64, b: u64, mul_p: u64) -> (
+    done: u1,
+    y: u64,
+    mul_a: u32,
+    mul_b: u32,
+) {
+    let st: MdState reset MdState::Idle;
+    let op: u3;
+    let w: u1;
+    let step: u7;
+    // Multiplier: magnitudes and the 128-bit accumulator. Divider: `hi` is the
+    // remainder, `lo` the dividend shifting into the quotient, `mb` the divisor.
+    let ma: u64;
+    let mb: u64;
+    let hi: u64;
+    let lo: u64;
+    let neg: u1;      // negate the product, or the quotient
+    let neg_r: u1;    // negate the remainder
+    let dz: u1;       // division by zero
+    let a_in: u64;    // the (extended) dividend, for division by zero
+
+    let is_div = f3[2];
+    // Operands as the operation sees them: 32-bit division extends the low words.
+    let signed_div = !f3[0];
+    let xa = if word & is_div { if signed_div { Sext32(a[0..32]).y } else { a[0..32] as u64 } } else { a };
+    let xb = if word & is_div { if signed_div { Sext32(b[0..32]).y } else { b[0..32] as u64 } } else { b };
+    // Which operands are signed: MULH both, MULHSU only a, DIV/REM both.
+    let sa = if is_div { signed_div } else { (f3 == 1) | (f3 == 2) };
+    let sb = if is_div { signed_div } else { f3 == 1 };
+    let na = sa & xa[63];
+    let nb = sb & xb[63];
+    let abs_a = if na { 0 - xa } else { xa };
+    let abs_b = if nb { 0 - xb } else { xb };
+
+    // Multiplier step: one 32x32 partial product, added in at bit 0, 32 or 64.
+    mul_a = if step[0] { ma[32..64] } else { ma[0..32] };
+    mul_b = if step[1] { mb[32..64] } else { mb[0..32] };
+    // The product arriving is the previous step's.
+    let pstep = step - 1;
+    let pp = mul_p;
+    let add_lo = match pstep[0..2] {
+        0 => pp,
+        3 => 0,
+        _ => pp << 32,
+    };
+    let add_hi = match pstep[0..2] {
+        0 => 0,
+        3 => pp,
+        _ => pp >> 32,
+    };
+    let sum_lo = lo + add_lo;
+    let carry = (lo[63] & add_lo[63]) | ((lo[63] | add_lo[63]) & !sum_lo[63]);
+
+    // Divider step: shift the next dividend bit into the remainder, subtract if it fits.
+    // One subtractor: the remainder fits if subtracting does not borrow (or the
+    // shifted-out bit makes it at least 2^64).
+    let rem_sh = cat(hi[0..63], lo[63]);
+    let rem_diff = rem_sh - mb;
+    let borrow = (!rem_sh[63] & mb[63]) | (!(rem_sh[63] ^ mb[63]) & rem_diff[63]);
+    let fits = hi[63] | !borrow;
+    let rem_next = if fits { rem_diff } else { rem_sh };
+
+    // The result, once in Fix. 128-bit negation of the product: invert, add one.
+    let nlo = 0 - lo;
+    let nhi = !hi + ((lo == 0) as u64);
+    let phi = if neg { nhi } else { hi };
+    let q = if neg { nlo } else { lo };
+    let r = if neg_r { 0 - hi } else { hi };
+    let res = match op {
+        0 => q,
+        1 | 2 | 3 => phi,
+        4 | 5 => if dz { 0xffff_ffff_ffff_ffff } else { q },
+        _ => if dz { a_in } else { r },
+    };
+    let result = if w { Sext32(res[0..32]).y } else { res };
+
+    done = 0;
+    y = 0;
+    match st {
+        MdState::Idle => if start {
+            op <= f3;
+            w <= word;
+            ma <= abs_a;
+            mb <= abs_b;
+            step <= 0;
+            a_in <= xa;
+            dz <= xb == 0;
+            if is_div {
+                st <= MdState::Div;
+                hi <= 0;
+                lo <= abs_a;
+                neg <= na ^ nb;
+                neg_r <= na;
+            } else {
+                st <= MdState::Mul;
+                hi <= 0;
+                lo <= 0;
+                neg <= na ^ nb;
+            }
+        },
+        MdState::Mul => {
+            if step != 0 {
+                lo <= sum_lo;
+                hi <= hi + add_hi + (carry as u64);
+            }
+            step <= step + 1;
+            if step == 4 {
+                st <= MdState::Fix;
+            }
+        }
+        MdState::Div => {
+            hi <= rem_next;
+            lo <= cat(lo[0..63], fits);
+            step <= step + 1;
+            if step == 63 {
+                st <= MdState::Fix;
+            }
+        }
+        MdState::Fix => {
+            st <= MdState::Idle;
+            done = 1;
+            y = result;
+        }
+    }
+
+    if kill {
+        st <= MdState::Idle;
+    }
+}

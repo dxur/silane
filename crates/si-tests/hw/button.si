@@ -1,0 +1,30 @@
+import "std:cdc";
+import "counter.si";
+
+// Counts presses of an asynchronous button: the input is synchronized with the
+// library's two-register synchronizer, then rising edges are counted.
+module Presses(button: u1) -> (count: u8) {
+    let s = Sync2(button);
+    let last: u1;
+    last <= s.q;
+
+    let c: Counter;           // an instance, connected below
+    c.en = s.q & !last;
+    c.clear = false;
+    count = c.count;
+}
+
+// A module used as a port type is just its interface: `Tap` reads a counter's
+// outputs and drives its inputs, but does not create one.
+module Tap(c: Counter) -> (high: u1) {
+    c.en = true;
+    c.clear = c.count == 200;
+    high = c.count[7];
+}
+
+module TapTop -> (high: u1, count: u8) {
+    let c: Counter;
+    let t = Tap(c);
+    high = t.high;
+    count = c.count;
+}

@@ -1,0 +1,15 @@
+[package]
+name = "silane-lang"
+version = "0.1.0"
+edition = "2024"
+description = "Compiler for the Silane hardware description language (.si) to the silane Rust DSL"
+
+[lib]
+name = "silane_lang"
+
+[[bin]]
+name = "silc"
+path = "src/bin/silc.rs"
+
+[dependencies]
+silane = { version = "0.1.0", path = "../silane" }

@@ -1,0 +1,785 @@
+// F and D: IEEE 754 single and double precision.
+//
+// Values are unpacked to a sign, an exponent (biased by OFF, wide enough for every
+// intermediate) and a significand whose bit 62 has the weight of the exponent;
+// subnormals are not normalized on the way in. Multiplication, addition and fused
+// multiply-add share one exact datapath: a 128-bit product (four 32x32 partial
+// products on the multiplier the core shares with MulDiv), alignment of the addend,
+// a 128-bit add, normalization, then one rounding. FADD/FSUB compute a * 1 + b.
+// Conversions from integers and between precisions go through the same
+// normalization and rounding. Division and square root normalize their operands
+// (one bit per cycle, for subnormals) and then produce one result bit per cycle.
+// Sign injection, min/max, comparisons, classification and moves finish in the
+// cycle after they start; conversions to integers two cycles later.
+//
+// To keep the area down the datapath has one 128-bit adder, one 128-bit right shifter
+// (alignment, rounding, conversion to integers) and one 128-bit normalizer, shared
+// by the states that need them.
+//
+// Single-precision values live NaN-boxed in the 64-bit registers: an operand whose
+// upper 32 bits are not all ones reads as the canonical NaN.
+
+import "defs.si";
+import "alu.si";
+
+const OFF: u14 = 0x1000;
+const CANON_D: u64 = 0x7ff8_0000_0000_0000;
+const CANON_S: u64 = 0xffff_ffff_7fc0_0000;
+
+// Rounding modes.
+const RNE: u3 = 0;
+const RTZ: u3 = 1;
+const RDN: u3 = 2;
+const RUP: u3 = 3;
+const RMM: u3 = 4;
+
+// A floating-point register value, unpacked.
+module FUnpack(x: u64, dbl: u1) -> (
+    sign: u1,
+    exp: u14,      // the exponent of bit 62 of `sig`, + OFF
+    sig: u64,      // the significand, the hidden bit at bit 62 (0 for subnormals)
+    zero: u1,
+    sub: u1,
+    norm: u1,
+    inf: u1,
+    nan: u1,
+    snan: u1,
+) {
+    let boxed = dbl | (x[32..64] == 0xffff_ffff);
+    let e = if dbl { x[52..63] } else { x[23..31] as u11 };
+    let f = if dbl { x[0..52] } else { x[0..23] as u52 };
+    let e_zero = e == 0;
+    let e_ones = e == (if dbl { 0x7ffu11 } else { 0xffu11 });
+    let f_zero = f == 0;
+    let quiet = if dbl { f[51] } else { f[22] };
+    let bias_adj = if dbl { OFF - 1023 } else { OFF - 127 };
+
+    sig = if dbl { cat(0u1, !e_zero, f, 0u10) } else { cat(0u1, !e_zero, f[0..23], 0u39) };
+    exp = if e_zero { bias_adj + 1 } else { (e as u14) + bias_adj };
+    sign = boxed & (if dbl { x[63] } else { x[31] });
+    nan = !boxed | (e_ones & !f_zero);
+    snan = boxed & e_ones & !f_zero & !quiet;
+    inf = boxed & e_ones & f_zero;
+    zero = boxed & e_zero & f_zero;
+    sub = boxed & e_zero & !f_zero;
+    norm = boxed & !e_zero & !e_ones;
+}
+
+// The rounding increment for a mode.
+module RoundInc(rm: u3, sign: u1, lsb: u1, guard: u1, sticky: u1) -> (inc: u1) {
+    inc = match rm {
+        RNE => guard & (sticky | lsb),
+        RDN => sign & (guard | sticky),
+        RUP => !sign & (guard | sticky),
+        RMM => guard,
+        _ => 0,
+    };
+}
+
+// How far FRound shifts its significand right: to the format's precision, and
+// further for a subnormal result.
+module RoundShift(exp: u14, dbl: u1) -> (n: u8) {
+    let emin = if dbl { OFF - 1022 } else { OFF - 126 };
+    let below = if exp < emin { emin - exp } else { 0u14 };
+    let rsh = (if dbl { 11u14 } else { 40u14 }) + below;
+    n = if rsh > 255 { 255u8 } else { rsh[0..8] };
+}
+
+// Rounds sign * sig * 2^(exp - OFF - 63) (`sig` has its leading one at bit 63, or is
+// zero) to the format, and packs it. `mant`, `low` and `lost` are `sig` shifted right
+// by RoundShift's amount (the kept bits, the bits below them from the top, and
+// whether any bit fell off the end). Flags: NV, DZ, OF, UF, NX (bits 4..0).
+// Tininess is detected after rounding.
+module FRound(
+    sign: u1, exp: u14, sig: u64, sticky: u1, dbl: u1, rm: u3,
+    mant: u64, low: u64, lost: u1,
+) -> (bits: u64, flags: u5) {
+    let emin = if dbl { OFF - 1022 } else { OFF - 126 };
+    let emax = if dbl { OFF + 1023 } else { OFF + 127 };
+
+    let guard = low[63];
+    let st = sticky | lost | (low[0..63] != 0);
+    let inc = RoundInc(rm, sign, mant[0], guard, st).inc;
+    let mant1 = mant[0..54] + (inc as u54);
+    let carry = if dbl { mant1[53] } else { mant1[24] };
+    let top = if dbl { mant1[52] } else { mant1[23] };
+
+    // Biased exponent field and fraction.
+    let normal = exp >= emin;
+    let field = if normal { exp - emin + 1 + (carry as u14) } else { top as u14 };
+    let frac = if carry { 0u54 } else { mant1 };
+    let over = normal & (exp + (carry as u14) > emax);
+    let inexact = guard | st;
+
+    // Tiny after rounding: below the smallest normal even when rounded to full
+    // precision with an unbounded exponent (which carries out only from all ones).
+    let lsb0 = if dbl { sig[11] } else { sig[40] };
+    let g0 = if dbl { sig[10] } else { sig[39] };
+    let s0 = sticky | (if dbl { sig[0..10] != 0 } else { sig[0..39] != 0 });
+    let ones0 = if dbl { sig[11..64].all() } else { sig[40..64].all() };
+    let carry0 = ones0 & RoundInc(rm, sign, lsb0, g0, s0).inc;
+    let tiny = (exp + 1 < emin) | ((exp + 1 == emin) & !carry0);
+
+    let to_inf = match rm {
+        RTZ => 0,
+        RDN => sign,
+        RUP => !sign,
+        _ => 1,
+    };
+    let d_bits = if over {
+        if to_inf { cat(sign, 0x7ffu11, 0u52) } else { cat(sign, 0x7feu11, rep(1u1, 52)) }
+    } else {
+        cat(sign, field[0..11], frac[0..52])
+    };
+    let s_bits = if over {
+        if to_inf { cat(0xffff_ffffu32, sign, 0xffu8, 0u23) } else { cat(0xffff_ffffu32, sign, 0xfeu8, rep(1u1, 23)) }
+    } else {
+        cat(0xffff_ffffu32, sign, field[0..8], frac[0..23])
+    };
+    let zero_bits = if dbl { cat(sign, 0u63) } else { cat(0xffff_ffffu32, sign, 0u31) };
+
+    bits = if sig == 0 { zero_bits } else if dbl { d_bits } else { s_bits };
+    flags = if sig == 0 { 0 } else { cat(0u2, over, !over & tiny & inexact, over | inexact) };
+}
+
+// Shift a 128-bit value right by n, with the bits shifted out or-ed into `sticky`.
+module Shr128(hi: u64, lo: u64, n: u8) -> (rhi: u64, rlo: u64, sticky: u1) {
+    let big = n >= 128;
+    let ge64 = n[6];
+    let s = n[0..6];
+    let hi_s = hi >> s;
+    let lo_s = lo >> s;
+    let hi_into_lo = if s == 0 { 0u64 } else { hi << (64 - (s as u7)) };
+    let lo_lost = if s == 0 { 0u64 } else { lo << (64 - (s as u7)) };
+    rhi = if big | ge64 { 0 } else { hi_s };
+    rlo = if big { 0 } else if ge64 { hi_s } else { lo_s | hi_into_lo };
+    sticky = if big { (hi | lo) != 0 } else if ge64 { (lo != 0) | (hi_into_lo != 0) } else { lo_lost != 0 };
+}
+
+// Shifts a nonzero 128-bit value left until bit 127 is set: seven stages that each
+// shift by 64, 32, ... 1 when the top bits are zero, counting the zeros (`z`).
+module Normalize128(hi: u64, lo: u64) -> (rhi: u64, rlo: u64, z: u7) {
+    let vh: [u64; 8];
+    let vl: [u64; 8];
+    let zs: [u7; 8];
+    vh[0] = hi;
+    vl[0] = lo;
+    zs[0] = 0;
+    for i in 0..7 {
+        let k = 64 >> i;
+        let top_zero = if k == 64 { vh[i] == 0 } else { vh[i][64 - k..64] == 0 };
+        let sh_hi = if k == 64 { vl[i] } else { (vh[i] << k) | (vl[i] >> (64 - k)) };
+        let sh_lo = if k == 64 { 0u64 } else { vl[i] << k };
+        vh[i + 1] = if top_zero { sh_hi } else { vh[i] };
+        vl[i + 1] = if top_zero { sh_lo } else { vl[i] };
+        zs[i + 1] = zs[i] + (if top_zero { k as u7 } else { 0u7 });
+    }
+    rhi = vh[7];
+    rlo = vl[7];
+    z = zs[7];
+}
+
+enum FState {
+    Idle, QOut, FiShift, FiRound, FiCheck, Mul, Align, Add, Neg, Norm,
+    DivNorm, Div, DivEnd, SqrtNorm, Sqrt, SqrtEnd, Round1, Round2,
+}
+
+// OP-FP funct5 values.
+const F_ADD: u5 = 0b00000;
+const F_SUB: u5 = 0b00001;
+const F_MUL: u5 = 0b00010;
+const F_DIV: u5 = 0b00011;
+const F_SQRT: u5 = 0b01011;
+const F_SGNJ: u5 = 0b00100;
+const F_MINMAX: u5 = 0b00101;
+const F_CVT_FF: u5 = 0b01000;
+const F_CMP: u5 = 0b10100;
+const F_CVT_FI: u5 = 0b11000;
+const F_CVT_IF: u5 = 0b11010;
+const F_MV_X: u5 = 0b11100;
+const F_MV_F: u5 = 0b11110;
+
+// Executes one F/D computational instruction (not loads or stores). `start` begins
+// it while idle, with `insn`, the register values `a`/`b`/`c` (rs1/rs2/rs3) and `x`
+// (integer rs1) held until `done`, which may come in the same cycle. `illegal`
+// (for `insn` and `frm`) must be checked before starting. `done` comes at least a
+// cycle later. The result goes to an integer register if `to_int`. Products come from a 32x32 multiplier outside:
+// `mul_p` is `mul_a * mul_b` of the previous cycle. `kill` abandons an operation.
+module Fpu(start: u1, kill: u1, insn: u32, frm: u3, a: u64, b: u64, c: u64, x: u64, mul_p: u64) -> (
+    illegal: u1,
+    to_int: u1,
+    done: u1,
+    result: u64,
+    flags: u5,
+    mul_a: u32,
+    mul_b: u32,
+) {
+    let st: FState reset FState::Idle;
+    let step: u7;
+    let acc_hi: u64;     // product / sum; divider remainder; sqrt radicand
+    let acc_lo: u64;     // divider quotient; sqrt remainder
+    let nb: u64;         // the divisor, normalized
+    let nb_exp: u14;
+    let r_sign: u1;
+    let r_exp: u14;
+    let r_sig: u64;      // sqrt root while iterating
+    let r_sticky: u1;
+    // Pipeline registers: the shifter's output (the kept bits, the bits below, any
+    // bit lost), the aligned addend, and a finished result.
+    let s_hi: u64;
+    let s_lo: u64;
+    let s_lost: u1;
+    let q_reg: u64;
+    let qf_reg: u5;
+    // The operands of a multi-cycle operation, unpacked and registered as it starts:
+    // the multiplicands (or the value converted), the addend, the signs, and the
+    // alignment, decided at the end of Mul.
+    let pa_sign: u1;
+    let pa_exp: u14;
+    let pa_sig: u64;
+    let pa_zero: u1;
+    let pa_nan: u1;
+    let pa_inf: u1;
+    let pm_exp: u14;
+    let pm_sig: u64;
+    let pc_exp: u14;
+    let pc_sig: u64;
+    let r_sp: u1;
+    let r_sc: u1;
+    let r_add: u1;
+    let r_pbig: u1;
+    let r_amt: u8;
+
+    // Decode.
+    let opc = insn[0..7];
+    let f5 = insn[27..32];
+    let fmt = insn[25..27];
+    let rs2f = insn[20..25];
+    let f3 = insn[12..15];
+    let rm = if f3 == 7 { frm } else { f3 };
+    let rm_ok = rm <= 4;
+    let dbl = fmt[0];
+    let fmt_ok = !fmt[1];
+    let is_op = opc == OPC_OP_FP;
+    let is_fma = !is_op;
+    let is_cvt_ff = is_op & (f5 == F_CVT_FF);
+    let legal = if is_fma {
+        fmt_ok & rm_ok
+    } else {
+        match f5 {
+            F_ADD | F_SUB | F_MUL | F_DIV => fmt_ok & rm_ok,
+            F_SQRT => fmt_ok & rm_ok & (rs2f == 0),
+            F_SGNJ | F_CMP => fmt_ok & (f3 <= 2),
+            F_MINMAX => fmt_ok & (f3 <= 1),
+            F_CVT_FF => rm_ok & (((fmt == 0) & (rs2f == 1)) | ((fmt == 1) & (rs2f == 0))),
+            F_CVT_FI | F_CVT_IF => fmt_ok & rm_ok & (rs2f <= 3),
+            F_MV_X => fmt_ok & (rs2f == 0) & (f3 <= 1),
+            F_MV_F => fmt_ok & (rs2f == 0) & (f3 == 0),
+            _ => 0,
+        }
+    };
+    illegal = !legal;
+    to_int = is_op & ((f5 == F_CMP) | (f5 == F_CVT_FI) | (f5 == F_MV_X));
+
+    // FCVT.S.D / FCVT.D.S read a in the other format.
+    let ua = FUnpack(a, if is_cvt_ff { rs2f[0] } else { dbl });
+    let ub = FUnpack(b, dbl);
+    let uc = FUnpack(c, dbl);
+
+    // Results of the format.
+    let canon = if dbl { CANON_D } else { CANON_S };
+    let zero_of = if dbl { 0u64 } else { 0xffff_ffff_0000_0000u64 };
+    let sign_bit = if dbl { 0x8000_0000_0000_0000u64 } else { 0x8000_0000u64 };
+    let inf_of = if dbl { 0x7ff0_0000_0000_0000u64 } else { 0xffff_ffff_7f80_0000u64 };
+
+    // ---- Multiply-add: m1 * m2 (+ addend). ----
+    let is_addsub = is_op & ((f5 == F_ADD) | (f5 == F_SUB));
+    let is_mul = is_op & (f5 == F_MUL);
+    let has_add = !is_mul;
+    let neg_prod = (opc == OPC_NMSUB) | (opc == OPC_NMADD);
+    let neg_add = (opc == OPC_MSUB) | (opc == OPC_NMADD) | (is_op & (f5 == F_SUB));
+    // The second multiplicand: b, or 1.0 for FADD/FSUB.
+    let m2_sign = if is_addsub { 0 } else { ub.sign };
+    let m2_exp = if is_addsub { OFF } else { ub.exp };
+    let m2_sig = if is_addsub { 0x4000_0000_0000_0000u64 } else { ub.sig };
+    let m2_zero = !is_addsub & ub.zero;
+    let m2_inf = !is_addsub & ub.inf;
+    let m2_nan = !is_addsub & ub.nan;
+    let m2_snan = !is_addsub & ub.snan;
+    // The addend: b for FADD/FSUB, c for the FMAs.
+    let ad_sign = if is_addsub { ub.sign } else { uc.sign };
+    let ad_exp = if is_addsub { ub.exp } else { uc.exp };
+    let ad_sig = if is_addsub { ub.sig } else { uc.sig };
+    let ad_zero = if is_addsub { ub.zero } else { uc.zero };
+    let ad_inf = if is_addsub { ub.inf } else { uc.inf };
+    let ad_nan = has_add & (if is_addsub { ub.nan } else { uc.nan });
+    let ad_snan = has_add & (if is_addsub { ub.snan } else { uc.snan });
+    let sp = ua.sign ^ m2_sign ^ neg_prod;
+    let sc = ad_sign ^ neg_add;
+    let p_inf = ua.inf | m2_inf;
+    let p_zero = ua.zero | m2_zero;
+    let ma_nan = ua.nan | m2_nan | ad_nan;
+    let ma_inv = ua.snan | m2_snan | ad_snan | (ua.inf & m2_zero) | (ua.zero & m2_inf)
+        | (!ma_nan & p_inf & has_add & ad_inf & (sp != sc));
+    let add_real = has_add & !ad_zero;
+    // From the registered operands:
+    let ep = pa_exp + pm_exp - OFF;
+
+    // Multiplier step: one 32x32 partial product, added at bit 0, 32 or 64.
+    mul_a = if step[0] { pa_sig[32..64] } else { pa_sig[0..32] };
+    mul_b = if step[1] { pm_sig[32..64] } else { pm_sig[0..32] };
+    let pstep = step - 1;
+    let pp = mul_p;
+    let pp_hi = match pstep[0..2] {
+        0 => 0,
+        3 => pp,
+        _ => pp >> 32,
+    };
+    let pp_lo = match pstep[0..2] {
+        0 => pp,
+        3 => 0,
+        _ => pp << 32,
+    };
+
+    // Alignment: P = acc (value P * 2^(ep - OFF - 124)), C = ad_sig << 62 (the same
+    // scale at ad_exp). The operand with the smaller exponent shifts right.
+    let c_hi = pc_sig >> 2;
+    let c_lo = pc_sig << 62;
+    let p_big_now = ep >= pc_exp;
+    let dexp = if p_big_now { ep - pc_exp } else { pc_exp - ep };
+    let p_big = r_pbig;
+    let same = r_sp == r_sc;
+    let sx = if p_big { r_sp } else { r_sc };
+
+    // FCVT to integers: W, WU, L, LU by rs2. The value is sig * 2^(e - 62).
+    let fi_e = pa_exp - OFF;                  // two's complement
+    let fi_small = fi_e[13];                  // e < 0: |value| < 1
+    let fi_s = 62 - fi_e[0..7];               // right shift for 0 <= e <= 62
+
+    // The shared right shifter: alignment (Align), rounding (Round1), conversion to
+    // integers (FiShift). Its output is registered.
+    let rnd_n = RoundShift(r_exp, dbl).n;
+    let in_align = st == FState::Align;
+    let in_round = st == FState::Round1;
+    let sh = Shr128(
+        if in_align { if p_big { c_hi } else { acc_hi } } else if in_round { r_sig } else { pa_sig },
+        if in_align { if p_big { c_lo } else { acc_lo } } else { 0 },
+        if in_align { r_amt } else if in_round { rnd_n } else { fi_s as u8 },
+    );
+
+    // The shared adder: accumulate partial products (Mul), add or subtract the
+    // aligned operands (Add), negate (Neg).
+    let x_hi = if p_big { acc_hi } else { c_hi };
+    let x_lo = if p_big { acc_lo } else { c_lo };
+    let y_hi = s_hi;
+    let y_lo = s_lo | (s_lost as u64);
+    let in_mul = st == FState::Mul;
+    let in_add = st == FState::Add;
+    let ad_a_hi = if in_mul { acc_hi } else if in_add { x_hi } else { 0 };
+    let ad_a_lo = if in_mul { acc_lo } else if in_add { x_lo } else { 0 };
+    let ad_b_hi = if in_mul { pp_hi } else if in_add & same { y_hi } else if in_add { !y_hi } else { !acc_hi };
+    let ad_b_lo = if in_mul { pp_lo } else if in_add & same { y_lo } else if in_add { !y_lo } else { !acc_lo };
+    let ad_cin = !in_mul & !(in_add & same);
+    let sum_lo = ad_a_lo + ad_b_lo + (ad_cin as u64);
+    // The carry out of bit 63, from the top bits (no second carry chain).
+    let c_lo_out = (ad_a_lo[63] & ad_b_lo[63]) | ((ad_a_lo[63] | ad_b_lo[63]) & !sum_lo[63]);
+    let sum_hi = ad_a_hi + ad_b_hi + (c_lo_out as u64);
+    // The carry out of bit 127: for x - y, set when x >= y.
+    let c_out = (ad_a_hi[63] & ad_b_hi[63]) | ((ad_a_hi[63] | ad_b_hi[63]) & !sum_hi[63]);
+
+    let nrm = Normalize128(acc_hi, acc_lo);
+
+    // ---- Division and square root steps. ----
+    // remainder - divisor, and its borrow out of bit 63 (the remainder can exceed 2^63).
+    let dv_diff = acc_hi - nb;
+    let dv_borrow = (!acc_hi[63] & nb[63]) | (!(acc_hi[63] ^ nb[63]) & dv_diff[63]);
+    let dv_ge = !dv_borrow;
+    let sq_rem = (acc_lo << 2) | (acc_hi[62..64] as u64);
+    let sq_diff = sq_rem - ((r_sig << 2) | 1);
+    let sq_ge = !sq_diff[63];
+
+    // ---- Operations that finish at once. ----
+    // Values in the format's width, unboxed (canonical NaN if not boxed).
+    let unboxed_a = !dbl & (a[32..64] != 0xffff_ffff);
+    let unboxed_b = !dbl & (b[32..64] != 0xffff_ffff);
+    let va = if dbl { a } else if unboxed_a { 0x7fc0_0000u64 } else { a[0..32] as u64 };
+    let vb = if dbl { b } else if unboxed_b { 0x7fc0_0000u64 } else { b[0..32] as u64 };
+    let box_ = if dbl { 0u64 } else { 0xffff_ffff_0000_0000u64 };
+    let mag_a = va & !sign_bit;
+    let mag_b = vb & !sign_bit;
+    let sa = (va & sign_bit) != 0;
+    let sb = (vb & sign_bit) != 0;
+    // a < b in the order with -0 < +0 (neither a NaN).
+    let mag_lt = mag_a < mag_b;
+    let mag_eq = mag_a == mag_b;
+    let a_lt = if sa != sb { sa } else if sa { !mag_lt & !mag_eq } else { mag_lt };
+    let both_zero = ua.zero & ub.zero;
+    let any_nan = ua.nan | ub.nan;
+    let any_snan = ua.snan | ub.snan;
+
+    let sgnj_sign = match f3 {
+        0 => sb,
+        1 => !sb,
+        _ => sa ^ sb,
+    };
+    let sgnj = box_ | (va & !sign_bit) | (if sgnj_sign { sign_bit } else { 0 });
+
+    let pick_a = if f3[0] { !a_lt } else { a_lt };
+    let minmax = if ua.nan & ub.nan { canon } else if ua.nan { box_ | vb } else if ub.nan { box_ | va }
+        else if pick_a { box_ | va } else { box_ | vb };
+
+    let feq = !any_nan & ((sa == sb) & mag_eq | both_zero);
+    let flt = !any_nan & a_lt & !both_zero;
+    let cmp = match f3 {
+        2 => feq,
+        1 => flt,
+        _ => flt | feq,
+    };
+    let cmp_nv = if f3 == 2 { any_snan } else { any_nan };
+
+    let fclass = cat(
+        ua.nan & !ua.snan, ua.snan,
+        !ua.sign & ua.inf, !ua.sign & ua.norm, !ua.sign & ua.sub, !ua.sign & ua.zero,
+        ua.sign & ua.zero, ua.sign & ua.sub, ua.sign & ua.norm, ua.sign & ua.inf,
+    ) as u64;
+    let mv_x = if f3[0] { fclass } else if dbl { a } else { Sext32(a[0..32]).y };
+    let mv_f = if dbl { x } else { cat(0xffff_ffffu32, x[0..32]) };
+
+    // FCVT to integers, with the shifter's result: the integer part and the bits below.
+    let fi_m = if fi_small { 0u64 } else { s_hi };
+    let fi_g = if fi_small { fi_e == 0x3fff } else { s_lo[63] };
+    let fi_st = if fi_small { (fi_e != 0x3fff) | (pa_sig[0..62] != 0) } else { s_lo[0..63] != 0 };
+    let fi_inc = RoundInc(rm, pa_sign, fi_m[0], fi_g & !pa_zero, fi_st & !pa_zero).inc;
+    let fi_sum = fi_m + (fi_inc as u64);
+    // (FiRound registers the rounded magnitude in s_hi, inexactness in s_lost.)
+    let fi_r = s_hi;
+    let fi_big = !fi_small & (fi_e > 62);     // |value| >= 2^63
+    let fi_signed = !rs2f[0];
+    let fi_lim = match rs2f[0..2] {
+        0 => if pa_sign { 0x8000_0000u64 } else { 0x7fff_ffffu64 },
+        1 => if pa_sign { 0u64 } else { 0xffff_ffffu64 },
+        2 => if pa_sign { 0x8000_0000_0000_0000u64 } else { 0x7fff_ffff_ffff_ffffu64 },
+        _ => if pa_sign { 0u64 } else { 0xffff_ffff_ffff_ffffu64 },
+    };
+    // LU takes values up to 2^64 - 1, so e = 63 fits; L takes exactly -2^63.
+    let fi_lu63 = (rs2f[0..2] == 3) & !pa_sign & (fi_e == 63);
+    let fi_min63 = (rs2f[0..2] == 2) & pa_sign & (fi_e == 63) & (pa_sig == 0x4000_0000_0000_0000);
+    let fi_ok = !pa_nan & !pa_inf & ((!fi_big & (fi_r <= fi_lim)) | fi_lu63 | fi_min63);
+    let fi_val = if fi_lu63 { pa_sig << 1 } else if fi_min63 { 0x8000_0000_0000_0000u64 }
+        else if pa_sign { 0 - fi_r } else { fi_r };
+    let fi_sat = if pa_nan | !pa_sign {
+        match rs2f[0..2] {
+            0 => 0x7fff_ffffu64,
+            1 => 0xffff_ffffu64,
+            2 => 0x7fff_ffff_ffff_ffffu64,
+            _ => 0xffff_ffff_ffff_ffffu64,
+        }
+    } else if fi_signed {
+        if rs2f[1] { 0x8000_0000_0000_0000u64 } else { 0x8000_0000u64 }
+    } else {
+        0u64
+    };
+    let fi_res = if fi_ok { fi_val } else { fi_sat };
+    let fi_out = if rs2f[1] { fi_res } else { Sext32(fi_res[0..32]).y };
+    let fi_nx = fi_ok & s_lost & !pa_zero & !fi_lu63 & !fi_min63;
+
+    // FCVT from integers.
+    let if_v = match rs2f[0..2] {
+        0 => Sext32(x[0..32]).y,
+        1 => x[0..32] as u64,
+        _ => x,
+    };
+    let if_neg = !rs2f[0] & if_v[63];
+
+    // The rounding stage.
+    let fr = FRound(r_sign, r_exp, r_sig, r_sticky, dbl, rm, s_hi, s_lo, s_lost);
+
+    // ---- Control. ----
+    let quick: u1;
+    let q_res: u64;
+    let q_flags: u5;
+    quick = 0;
+    q_res = 0;
+    q_flags = 0;
+
+    done = 0;
+    result = q_reg;
+    flags = qf_reg;
+
+    match st {
+        FState::Idle => if start {
+            pa_sign <= ua.sign;
+            pa_exp <= ua.exp;
+            pa_sig <= ua.sig;
+            pa_zero <= ua.zero;
+            pa_nan <= ua.nan;
+            pa_inf <= ua.inf;
+            pm_exp <= m2_exp;
+            pm_sig <= m2_sig;
+            pc_exp <= ad_exp;
+            pc_sig <= ad_sig;
+            r_sp <= sp;
+            r_sc <= sc;
+            r_add <= add_real;
+            if is_fma | is_addsub | is_mul {
+                if ma_nan | ma_inv {
+                    quick = 1;
+                    q_res = canon;
+                    q_flags = cat(ma_inv, 0u4);
+                } else if p_inf {
+                    quick = 1;
+                    q_res = inf_of | (if sp { sign_bit } else { 0 });
+                } else if has_add & ad_inf {
+                    quick = 1;
+                    q_res = inf_of | (if sc { sign_bit } else { 0 });
+                } else if p_zero & !add_real {
+                    // An exact zero: x + -x is -0 only when rounding down.
+                    quick = 1;
+                    let zs = if !has_add { sp } else if sp == sc { sp } else { rm == RDN };
+                    q_res = zero_of | (if zs { sign_bit } else { 0 });
+                } else if p_zero {
+                    // 0 * y + c = c: normalized and rounded (exactly).
+                    acc_hi <= ad_sig;
+                    acc_lo <= 0;
+                    r_sign <= sc;
+                    r_exp <= ad_exp - 2;
+                    st <= FState::Norm;
+                } else {
+                    acc_hi <= 0;
+                    acc_lo <= 0;
+                    step <= 0;
+                    st <= FState::Mul;
+                }
+            } else {
+                match f5 {
+                    F_DIV => {
+                        if any_nan | both_zero | (ua.inf & ub.inf) {
+                            quick = 1;
+                            q_res = canon;
+                            q_flags = cat(any_snan | both_zero | (ua.inf & ub.inf), 0u4);
+                        } else if ua.inf | ub.zero {
+                            quick = 1;
+                            q_res = inf_of | (if ua.sign ^ ub.sign { sign_bit } else { 0 });
+                            q_flags = cat(0u1, ub.zero & !ua.inf, 0u3);
+                        } else if ua.zero | ub.inf {
+                            quick = 1;
+                            q_res = zero_of | (if ua.sign ^ ub.sign { sign_bit } else { 0 });
+                        } else {
+                            acc_hi <= ua.sig;
+                            r_exp <= ua.exp;
+                            nb <= ub.sig;
+                            nb_exp <= ub.exp;
+                            r_sign <= ua.sign ^ ub.sign;
+                            st <= FState::DivNorm;
+                        }
+                    }
+                    F_SQRT => {
+                        if ua.nan | (ua.sign & !ua.zero) {
+                            quick = 1;
+                            q_res = canon;
+                            q_flags = cat(ua.snan | (ua.sign & !ua.zero & !ua.nan), 0u4);
+                        } else if ua.zero | ua.inf {
+                            quick = 1;
+                            q_res = box_ | va;
+                        } else {
+                            acc_hi <= ua.sig;
+                            r_exp <= ua.exp;
+                            st <= FState::SqrtNorm;
+                        }
+                    }
+                    F_SGNJ => {
+                        quick = 1;
+                        q_res = sgnj;
+                    }
+                    F_MINMAX => {
+                        quick = 1;
+                        q_res = minmax;
+                        q_flags = cat(any_snan, 0u4);
+                    }
+                    F_CMP => {
+                        quick = 1;
+                        q_res = cmp as u64;
+                        q_flags = cat(cmp_nv, 0u4);
+                    }
+                    F_MV_X => {
+                        quick = 1;
+                        q_res = mv_x;
+                    }
+                    F_MV_F => {
+                        quick = 1;
+                        q_res = mv_f;
+                    }
+                    // (The operand is registered first.)
+                    F_CVT_FI => st <= FState::FiShift,
+                    F_CVT_IF => {
+                        // The magnitude in the upper word: its bit 63 has weight 2^63.
+                        acc_hi <= if if_neg { 0 - if_v } else { if_v };
+                        acc_lo <= 0;
+                        r_sign <= if_neg;
+                        r_exp <= OFF + 60;
+                        st <= FState::Norm;
+                    }
+                    _ => {
+                        // FCVT.S.D / FCVT.D.S
+                        if ua.nan {
+                            quick = 1;
+                            q_res = canon;
+                            q_flags = cat(ua.snan, 0u4);
+                        } else if ua.inf {
+                            quick = 1;
+                            q_res = inf_of | (if ua.sign { sign_bit } else { 0 });
+                        } else if ua.zero {
+                            quick = 1;
+                            q_res = zero_of | (if ua.sign { sign_bit } else { 0 });
+                        } else {
+                            acc_hi <= ua.sig;
+                            acc_lo <= 0;
+                            r_sign <= ua.sign;
+                            r_exp <= ua.exp - 2;
+                            st <= FState::Norm;
+                        }
+                    }
+                }
+            }
+        },
+        FState::Mul => {
+            if step != 0 {
+                acc_lo <= sum_lo;
+                acc_hi <= sum_hi;
+            }
+            step <= step + 1;
+            if step == 4 {
+                st <= if r_add { FState::Align } else { FState::Norm };
+                r_sign <= r_sp;
+                r_exp <= ep;
+                r_pbig <= p_big_now;
+                r_amt <= if dexp > 255 { 255u8 } else { dexp[0..8] };
+            }
+        }
+        FState::Align => {
+            s_hi <= sh.rhi;
+            s_lo <= sh.rlo;
+            s_lost <= sh.sticky;
+            st <= FState::Add;
+        }
+        FState::Add => {
+            // x + y, or x - y: negative (no carry out) means y was the larger.
+            acc_hi <= sum_hi;
+            acc_lo <= sum_lo;
+            r_exp <= if p_big { r_exp } else { pc_exp };
+            r_sign <= if (sum_hi | sum_lo) == 0 { rm == RDN } else { sx };
+            st <= if !same & !c_out { FState::Neg } else { FState::Norm };
+        }
+        FState::Neg => {
+            acc_hi <= sum_hi;
+            acc_lo <= sum_lo;
+            r_sign <= !r_sign;
+            st <= FState::Norm;
+        }
+        FState::Norm => {
+            // acc has its bit 124 at exponent r_exp.
+            r_sig <= if (acc_hi | acc_lo) == 0 { 0 } else { nrm.rhi };
+            r_sticky <= nrm.rlo != 0;
+            r_exp <= r_exp + 3 - (nrm.z as u14);
+            st <= FState::Round1;
+        }
+        FState::DivNorm => {
+            // Normalize subnormal operands, a bit per cycle.
+            if !acc_hi[62] {
+                acc_hi <= acc_hi << 1;
+                r_exp <= r_exp - 1;
+            }
+            if !nb[62] {
+                nb <= nb << 1;
+                nb_exp <= nb_exp - 1;
+            }
+            if acc_hi[62] & nb[62] {
+                acc_lo <= 0;
+                step <= 0;
+                r_exp <= r_exp + OFF - nb_exp;
+                st <= FState::Div;
+            }
+        }
+        FState::Div => {
+            acc_hi <= (if dv_ge { dv_diff } else { acc_hi }) << 1;
+            acc_lo <= cat(acc_lo[0..63], dv_ge);
+            step <= step + 1;
+            if step == 63 {
+                st <= FState::DivEnd;
+            }
+        }
+        FState::DivEnd => {
+            r_sig <= if acc_lo[63] { acc_lo } else { acc_lo << 1 };
+            r_exp <= if acc_lo[63] { r_exp } else { r_exp - 1 };
+            r_sticky <= acc_hi != 0;
+            st <= FState::Round1;
+        }
+        FState::SqrtNorm => if !acc_hi[62] {
+            acc_hi <= acc_hi << 1;
+            r_exp <= r_exp - 1;
+        } else {
+            // An odd exponent doubles the radicand.
+            acc_hi <= if r_exp[0] { acc_hi << 1 } else { acc_hi };
+            r_exp <= (r_exp >> 1) + (OFF >> 1);
+            acc_lo <= 0;
+            r_sig <= 0;
+            step <= 0;
+            r_sign <= 0;
+            st <= FState::Sqrt;
+        },
+        FState::Sqrt => {
+            acc_hi <= acc_hi << 2;
+            acc_lo <= if sq_ge { sq_diff } else { sq_rem };
+            r_sig <= cat(r_sig[0..63], sq_ge);
+            step <= step + 1;
+            if step == 56 {
+                st <= FState::SqrtEnd;
+            }
+        }
+        FState::SqrtEnd => {
+            r_sig <= r_sig << 7;
+            r_sticky <= acc_lo != 0;
+            st <= FState::Round1;
+        }
+        FState::Round1 => {
+            s_hi <= sh.rhi;
+            s_lo <= sh.rlo;
+            s_lost <= sh.sticky;
+            st <= FState::Round2;
+        }
+        FState::Round2 => {
+            q_reg <= fr.bits;
+            qf_reg <= fr.flags;
+            st <= FState::QOut;
+        }
+        FState::FiShift => {
+            s_hi <= sh.rhi;
+            s_lo <= sh.rlo;
+            st <= FState::FiRound;
+        }
+        FState::FiRound => {
+            s_hi <= fi_sum;
+            s_lost <= fi_g | fi_st;
+            st <= FState::FiCheck;
+        }
+        FState::FiCheck => {
+            q_reg <= fi_out;
+            qf_reg <= cat(!fi_ok, 0u3, fi_nx);
+            st <= FState::QOut;
+        }
+        FState::QOut => {
+            done = 1;
+            st <= FState::Idle;
+        }
+    }
+
+    // Results ready at once leave from a register in the next cycle.
+    if quick {
+        q_reg <= q_res;
+        qf_reg <= q_flags;
+        st <= FState::QOut;
+    }
+    if kill {
+        st <= FState::Idle;
+    }
+}

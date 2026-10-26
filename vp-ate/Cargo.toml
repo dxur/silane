@@ -1,0 +1,11 @@
+[package]
+name = "vp-ate"
+version = "0.1.0"
+edition = "2024"
+description = "VP8 key-frame decoder in silane, with its software reference model"
+
+[dependencies]
+silane = { path = "../crates/silane" }
+
+[build-dependencies]
+silane-lang = { path = "../crates/silane-lang" }
