@@ -6,7 +6,7 @@ Hardware can also be written in **the Silane language** (`.si` files), which com
 
 ## Key Features
 
-- **Clock Domain Safety**: Generativity-branded signals keep wires of different elaborations apart.
+- **Clock Domain Safety**: A signal's clock domain is part of its type, so logic only combines signals of one domain and crossing domains takes a synchronizer (`silane::cdc`).
 - **Typestate Wire Safety**: Distinguishes between `UnBound` (unassigned drivers) and `Bound` (readable physical nets) wires.
 - **Static Widths**: Bit widths are typenum types, so width mismatches are compile errors.
 - **Rich Operator Suite**: Arithmetic, bitwise, shift and comparison operators, slicing, extension, concatenation, multiplexing.
