@@ -2,6 +2,7 @@
 name = "silane-lang"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "Compiler for the Silane hardware description language (.si) to the silane Rust DSL"
 
 [lib]

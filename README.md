@@ -95,7 +95,7 @@ You need a recent stable Rust toolchain (edition 2024) and a C compiler, which t
 simulator uses (set `SILANE_SIM=interp` to interpret instead).
 
 ```sh
-git clone <this repo> && cd silane
+git clone https://github.com/dxur/silane.git && cd silane
 cargo test --release                  # the compiler and example-design tests
 ```
 
@@ -163,3 +163,11 @@ The book lives in [`docs/src`](docs/src) (build it with `mdbook build docs`):
 A VS Code extension with a TextMate grammar for `.si` is in
 [`editors/vscode`](editors/vscode). Build the package with
 `python3 editors/vscode/build_vsix.py`, then install the resulting `silane.vsix`.
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT), at your option.
+
+The conformance and demo videos in `vp-ate/samples/` are not covered by this license;
+they keep their original terms (the Big Buck Bunny clip is CC-BY).

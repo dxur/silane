@@ -2,6 +2,7 @@
 name = "vp-ate"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
 description = "VP8 key-frame decoder in silane, with its software reference model"
 
 [dependencies]
