@@ -1,0 +1,3 @@
+# GitHub (linguist) doesn't know Silane, so .si files get no highlighting and are left
+# out of the language bar. Rust is the closest grammar available.
+*.si linguist-language=Rust
