@@ -13,6 +13,16 @@ Simulate it natively, export Verilog, and boot Linux on a CPU you wrote in it.
 
 ---
 
+> **Author's note**
+>
+> Silane is a hobby project. It grew out of several independent private repositories,
+> including my graduation project, which were merged into this one. I built it for my own
+> designs and it is not intended for production use. Use it at your own risk.
+>
+> If you find it useful, a star is appreciated.
+
+---
+
 ## A taste
 
 ```rust
